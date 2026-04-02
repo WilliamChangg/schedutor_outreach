@@ -1,0 +1,118 @@
+{
+  "rules": [
+    {
+      "id": "business_type_agency",
+      "name": "Business Type: Agency",
+      "description": "Agencies have higher LTV and more complex scheduling needs",
+      "condition": {
+        "field": "business_type",
+        "operator": "equals",
+        "value": "agency"
+      },
+      "points": 20
+    },
+    {
+      "id": "has_website",
+      "name": "Has Website",
+      "description": "Indicates established business, more likely to adopt SaaS",
+      "condition": {
+        "field": "website",
+        "operator": "not_null"
+      },
+      "points": 10
+    },
+    {
+      "id": "multiple_tutors",
+      "name": "Has Multiple Tutors",
+      "description": "Multi-tutor operations need scheduling tools most",
+      "condition": {
+        "field": "enrichment.has_multiple_tutors",
+        "operator": "equals",
+        "value": true
+      },
+      "points": 15
+    },
+    {
+      "id": "no_scheduling_tool",
+      "name": "No Existing Scheduling Tool",
+      "description": "Green field opportunity - no switching cost",
+      "condition": {
+        "field": "enrichment.existing_scheduling_tool",
+        "operator": "is_null"
+      },
+      "points": 15
+    },
+    {
+      "id": "has_competitor_tool",
+      "name": "Uses Competitor Tool",
+      "description": "Open to switching but harder sell",
+      "condition": {
+        "field": "enrichment.existing_scheduling_tool",
+        "operator": "not_null"
+      },
+      "points": 5
+    },
+    {
+      "id": "high_google_rating",
+      "name": "High Google Rating (4.0+)",
+      "description": "Active, quality-conscious business",
+      "condition": {
+        "field": "google_rating",
+        "operator": "gte",
+        "value": 4.0
+      },
+      "points": 5
+    },
+    {
+      "id": "established_reviews",
+      "name": "Established Review Base (20+)",
+      "description": "Established business with active client base",
+      "condition": {
+        "field": "google_review_count",
+        "operator": "gte",
+        "value": 20
+      },
+      "points": 10
+    },
+    {
+      "id": "verified_email",
+      "name": "Has Verified Email",
+      "description": "Can actually reach them",
+      "condition": {
+        "field": "has_verified_email",
+        "operator": "equals",
+        "value": true
+      },
+      "points": 10
+    },
+    {
+      "id": "has_social_presence",
+      "name": "Has Social Media Presence",
+      "description": "Tech-savvy, likely SaaS adopter",
+      "condition": {
+        "field": "has_social_presence",
+        "operator": "equals",
+        "value": true
+      },
+      "points": 5
+    },
+    {
+      "id": "franchise_type",
+      "name": "Franchise Location",
+      "description": "Franchises often have corporate tools, harder to sell",
+      "condition": {
+        "field": "business_type",
+        "operator": "equals",
+        "value": "franchise"
+      },
+      "points": -10
+    }
+  ],
+  "maxScore": 100,
+  "scoreTiers": {
+    "hot": { "min": 70, "label": "Hot Lead" },
+    "warm": { "min": 50, "label": "Warm Lead" },
+    "cool": { "min": 30, "label": "Cool Lead" },
+    "cold": { "min": 0, "label": "Cold Lead" }
+  }
+}
