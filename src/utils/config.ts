@@ -1,3 +1,12 @@
+import { config as dotenvConfig } from 'dotenv';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Load .env from project root
+dotenvConfig({ path: join(__dirname, '../../.env') });
+
 export interface Config {
   googleMapsApiKey: string;
   sesRegion?: string;
@@ -5,11 +14,14 @@ export interface Config {
   sesSecretAccessKey?: string;
 }
 
+let configLoaded = false;
+
 export function getConfig(): Config {
   const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
 
-  if (!googleMapsApiKey) {
-    console.warn('Warning: GOOGLE_MAPS_API_KEY not set. Google Maps discovery will not work.');
+  if (!googleMapsApiKey && !configLoaded) {
+    console.warn('Warning: GOOGLE_MAPS_API_KEY not set in .env file. Google Maps discovery will not work.');
+    configLoaded = true;
   }
 
   return {
@@ -78,3 +90,69 @@ export const DISCOVERY_QUERIES = [
   'private tutor',
   'tutoring agency'
 ];
+
+// Sublocations for major metros (enables deeper discovery with --deep flag)
+// Key format: "City, State/Province"
+export const METRO_SUBLOCATIONS: Record<string, Array<{ name: string; lat: number; lng: number }>> = {
+  // Canada
+  'Toronto, ON': [
+    { name: 'Downtown Toronto', lat: 43.6532, lng: -79.3832 },
+    { name: 'North York', lat: 43.7615, lng: -79.4111 },
+    { name: 'Scarborough', lat: 43.7731, lng: -79.2578 },
+    { name: 'Etobicoke', lat: 43.6205, lng: -79.5132 },
+    { name: 'Mississauga', lat: 43.5890, lng: -79.6441 },
+    { name: 'Markham', lat: 43.8561, lng: -79.3370 },
+    { name: 'Richmond Hill', lat: 43.8828, lng: -79.4403 },
+  ],
+  'Vancouver, BC': [
+    { name: 'Downtown Vancouver', lat: 49.2827, lng: -123.1207 },
+    { name: 'Burnaby', lat: 49.2488, lng: -122.9805 },
+    { name: 'Surrey', lat: 49.1913, lng: -122.8490 },
+    { name: 'Richmond', lat: 49.1666, lng: -123.1336 },
+    { name: 'Coquitlam', lat: 49.2838, lng: -122.7932 },
+  ],
+  'Montreal, QC': [
+    { name: 'Downtown Montreal', lat: 45.5017, lng: -73.5673 },
+    { name: 'Laval', lat: 45.6066, lng: -73.7124 },
+    { name: 'Longueuil', lat: 45.5312, lng: -73.5185 },
+    { name: 'West Island', lat: 45.4720, lng: -73.7949 },
+  ],
+  // USA
+  'New York, NY': [
+    { name: 'Manhattan', lat: 40.7831, lng: -73.9712 },
+    { name: 'Brooklyn', lat: 40.6782, lng: -73.9442 },
+    { name: 'Queens', lat: 40.7282, lng: -73.7949 },
+    { name: 'Bronx', lat: 40.8448, lng: -73.8648 },
+    { name: 'Staten Island', lat: 40.5795, lng: -74.1502 },
+    { name: 'Jersey City', lat: 40.7178, lng: -74.0431 },
+  ],
+  'Los Angeles, CA': [
+    { name: 'Downtown LA', lat: 34.0522, lng: -118.2437 },
+    { name: 'Santa Monica', lat: 34.0195, lng: -118.4912 },
+    { name: 'Pasadena', lat: 34.1478, lng: -118.1445 },
+    { name: 'Long Beach', lat: 33.7701, lng: -118.1937 },
+    { name: 'Glendale', lat: 34.1425, lng: -118.2551 },
+    { name: 'Irvine', lat: 33.6846, lng: -117.8265 },
+  ],
+  'Chicago, IL': [
+    { name: 'Downtown Chicago', lat: 41.8781, lng: -87.6298 },
+    { name: 'Evanston', lat: 42.0451, lng: -87.6877 },
+    { name: 'Oak Park', lat: 41.8850, lng: -87.7845 },
+    { name: 'Naperville', lat: 41.7508, lng: -88.1535 },
+    { name: 'Schaumburg', lat: 42.0334, lng: -88.0834 },
+  ],
+  'Houston, TX': [
+    { name: 'Downtown Houston', lat: 29.7604, lng: -95.3698 },
+    { name: 'Sugar Land', lat: 29.6197, lng: -95.6349 },
+    { name: 'The Woodlands', lat: 30.1658, lng: -95.4613 },
+    { name: 'Katy', lat: 29.7858, lng: -95.8245 },
+    { name: 'Pearland', lat: 29.5636, lng: -95.2860 },
+  ],
+  'Boston, MA': [
+    { name: 'Downtown Boston', lat: 42.3601, lng: -71.0589 },
+    { name: 'Cambridge', lat: 42.3736, lng: -71.1097 },
+    { name: 'Brookline', lat: 42.3318, lng: -71.1212 },
+    { name: 'Newton', lat: 42.3370, lng: -71.2092 },
+    { name: 'Somerville', lat: 42.3876, lng: -71.0995 },
+  ],
+};

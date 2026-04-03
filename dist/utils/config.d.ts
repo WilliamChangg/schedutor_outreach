@@ -20,3 +20,8 @@ export declare const METRO_AREAS: {
     }[];
 };
 export declare const DISCOVERY_QUERIES: string[];
+export declare const METRO_SUBLOCATIONS: Record<string, Array<{
+    name: string;
+    lat: number;
+    lng: number;
+}>>;

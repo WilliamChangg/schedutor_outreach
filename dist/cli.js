@@ -4,11 +4,15 @@ import { discoverLeadsInMetro, discoverLeadsInMultipleMetros, testGoogleMapsConn
 import { enrichAndSaveLead } from './enrichment/index.js';
 import { scoreAllLeads, scoreAndSaveLead, explainScore } from './scoring/index.js';
 import { exportLeadsToCSV } from './utils/csv-export.js';
-import { METRO_AREAS } from './utils/config.js';
+import { METRO_AREAS, METRO_SUBLOCATIONS } from './utils/config.js';
 // Initialize database
 initializeDatabase();
 const command = process.argv[2];
 const args = process.argv.slice(3);
+// Parse flags
+const hasFlag = (flag) => args.includes(flag);
+const deepMode = hasFlag('--deep');
+const argsWithoutFlags = args.filter(a => !a.startsWith('--'));
 async function main() {
     switch (command) {
         case 'test-connection':
@@ -17,13 +21,17 @@ async function main() {
             process.exit(connected ? 0 : 1);
             break;
         case 'discover': {
-            const metroName = args[0];
-            const country = (args[1]?.toUpperCase() || 'US');
+            const metroName = argsWithoutFlags[0];
+            const country = (argsWithoutFlags[1]?.toUpperCase() || 'US');
+            const options = { deep: deepMode };
+            if (deepMode) {
+                console.log('Deep discovery mode: all queries + pagination + sublocations');
+            }
             if (!metroName) {
                 // Run on first 5 metros
                 console.log('Running discovery on first 5 US metros...');
                 const metros = METRO_AREAS.US.slice(0, 5);
-                const result = await discoverLeadsInMultipleMetros(metros, 'US', undefined, console.log);
+                const result = await discoverLeadsInMultipleMetros(metros, 'US', options, console.log);
                 console.log('\n=== Discovery Complete ===');
                 console.log(`Total found: ${result.leadsFound}`);
                 console.log(`New leads: ${result.leadsNew}`);
@@ -37,8 +45,13 @@ async function main() {
                     console.log('Available metros:', metros.map(m => m.name).join(', '));
                     process.exit(1);
                 }
+                const metroKey = `${metro.name}, ${metro.state}`;
+                const hasSublocations = METRO_SUBLOCATIONS[metroKey];
+                if (deepMode && hasSublocations) {
+                    console.log(`Sublocations available: ${hasSublocations.map(s => s.name).join(', ')}`);
+                }
                 console.log(`Discovering leads in ${metro.name}, ${metro.state}...`);
-                const result = await discoverLeadsInMetro(metro, country, undefined, console.log);
+                const result = await discoverLeadsInMetro(metro, country, options, console.log);
                 console.log('\n=== Discovery Complete ===');
                 console.log(`Total found: ${result.leadsFound}`);
                 console.log(`New leads: ${result.leadsNew}`);
@@ -116,7 +129,7 @@ async function main() {
             console.log(`
 Schedutor Outbound Sales Engine - CLI
 
-Usage: npx tsx src/cli.ts <command> [args]
+Usage: npx tsx src/cli.ts <command> [args] [flags]
 
 Commands:
   test-connection              Test Google Maps API connection
@@ -128,9 +141,13 @@ Commands:
   list [limit]                 List recent leads
   help                         Show this help
 
+Flags:
+  --deep                       Deep discovery: all 12 queries + pagination + suburbs
+
 Examples:
-  npx tsx src/cli.ts discover "New York" US
-  npx tsx src/cli.ts discover Toronto CA
+  npx tsx src/cli.ts discover Toronto CA            # Basic discovery (~30 leads)
+  npx tsx src/cli.ts discover Toronto CA --deep     # Deep discovery (~300+ leads)
+  npx tsx src/cli.ts discover "New York" US --deep  # Deep discovery with suburbs
   npx tsx src/cli.ts enrich 50
   npx tsx src/cli.ts score
   npx tsx src/cli.ts export hot

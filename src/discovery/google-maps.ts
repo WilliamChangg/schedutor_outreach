@@ -1,6 +1,8 @@
 import { request } from 'undici';
-import { getConfig, METRO_AREAS, DISCOVERY_QUERIES } from '../utils/config.js';
+import { getConfig, METRO_AREAS, DISCOVERY_QUERIES, METRO_SUBLOCATIONS } from '../utils/config.js';
 import { googleMapsRateLimiter } from '../utils/rate-limiter.js';
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 import {
   insertLead,
   getLeadBySourceId,
@@ -61,31 +63,57 @@ const PLACES_API_BASE = 'https://maps.googleapis.com/maps/api/place';
 export async function searchPlaces(
   query: string,
   location: { lat: number; lng: number },
-  radiusMeters: number = 50000 // 50km default radius
+  radiusMeters: number = 50000, // 50km default radius
+  paginate: boolean = false // Whether to fetch all pages (up to 60 results)
 ): Promise<PlaceResult[]> {
   const config = getConfig();
   if (!config.googleMapsApiKey) {
     throw new Error('Google Maps API key not configured');
   }
 
-  await googleMapsRateLimiter.waitForSlot();
+  const allResults: PlaceResult[] = [];
+  let pageToken: string | undefined;
 
-  const params = new URLSearchParams({
-    query: query,
-    location: `${location.lat},${location.lng}`,
-    radius: radiusMeters.toString(),
-    key: config.googleMapsApiKey
-  });
+  do {
+    await googleMapsRateLimiter.waitForSlot();
 
-  const url = `${PLACES_API_BASE}/textsearch/json?${params}`;
-  const response = await request(url);
-  const data = await response.body.json() as TextSearchResponse;
+    const params = new URLSearchParams({
+      query: query,
+      location: `${location.lat},${location.lng}`,
+      radius: radiusMeters.toString(),
+      key: config.googleMapsApiKey
+    });
 
-  if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
-    throw new Error(`Google Places API error: ${data.status} - ${data.error_message}`);
-  }
+    if (pageToken) {
+      params.set('pagetoken', pageToken);
+    }
 
-  return data.results || [];
+    const url = `${PLACES_API_BASE}/textsearch/json?${params}`;
+    const response = await request(url);
+    const data = await response.body.json() as TextSearchResponse;
+
+    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+      // INVALID_REQUEST often means page token not ready yet
+      if (data.status === 'INVALID_REQUEST' && pageToken) {
+        await sleep(2000);
+        continue;
+      }
+      throw new Error(`Google Places API error: ${data.status} - ${data.error_message}`);
+    }
+
+    allResults.push(...(data.results || []));
+
+    // Only continue pagination if enabled and there's a next page
+    if (paginate && data.next_page_token) {
+      pageToken = data.next_page_token;
+      // Google requires a delay before using next_page_token
+      await sleep(2000);
+    } else {
+      pageToken = undefined;
+    }
+  } while (pageToken);
+
+  return allResults;
 }
 
 export async function getPlaceDetails(placeId: string): Promise<PlaceDetails | null> {
@@ -184,12 +212,33 @@ export interface DiscoveryResult {
   leads: Lead[];
 }
 
+export interface DiscoveryOptions {
+  queries?: string[];
+  deep?: boolean; // Use all queries, pagination, and sublocations
+  paginate?: boolean;
+  useSublocations?: boolean;
+}
+
 export async function discoverLeadsInMetro(
   metro: { name: string; state: string; lat: number; lng: number },
   country: 'US' | 'CA',
-  queries: string[] = DISCOVERY_QUERIES.slice(0, 3), // Start with first 3 queries
+  options: DiscoveryOptions = {},
   onProgress?: (message: string) => void
 ): Promise<DiscoveryResult> {
+  // Handle deep mode - enable all features
+  const deep = options.deep ?? false;
+  const queries = options.queries ?? (deep ? DISCOVERY_QUERIES : DISCOVERY_QUERIES.slice(0, 3));
+  const paginate = options.paginate ?? deep;
+  const useSublocations = options.useSublocations ?? deep;
+
+  // Get sublocations if enabled and available
+  const metroKey = `${metro.name}, ${metro.state}`;
+  const sublocations = useSublocations && METRO_SUBLOCATIONS[metroKey]
+    ? METRO_SUBLOCATIONS[metroKey]
+    : [{ name: metro.name, lat: metro.lat, lng: metro.lng }];
+
+  const radius = sublocations.length > 1 ? 15000 : 50000; // 15km for sublocations, 50km otherwise
+
   const run = startDiscoveryRun('google_maps', queries.join(', '), `${metro.name}, ${metro.state}`);
   const result: DiscoveryResult = {
     leadsFound: 0,
@@ -201,74 +250,85 @@ export async function discoverLeadsInMetro(
   const seenPlaceIds = new Set<string>();
 
   try {
-    for (const query of queries) {
-      const searchQuery = `${query} in ${metro.name}, ${metro.state}`;
-      onProgress?.(`Searching: "${searchQuery}"`);
+    for (const sublocation of sublocations) {
+      if (sublocations.length > 1) {
+        onProgress?.(`\n  Searching ${sublocation.name}...`);
+      }
 
-      const places = await searchPlaces(query, { lat: metro.lat, lng: metro.lng });
-      onProgress?.(`Found ${places.length} results for "${query}"`);
+      for (const query of queries) {
+        const searchQuery = `${query} in ${metro.name}, ${metro.state}`;
+        onProgress?.(`Searching: "${query}"${paginate ? ' (with pagination)' : ''}`);
 
-      for (const place of places) {
-        // Skip if we've already seen this place ID in this run
-        if (seenPlaceIds.has(place.place_id)) {
-          continue;
+        const places = await searchPlaces(
+          query,
+          { lat: sublocation.lat, lng: sublocation.lng },
+          radius,
+          paginate
+        );
+        onProgress?.(`Found ${places.length} results for "${query}"`);
+
+        for (const place of places) {
+          // Skip if we've already seen this place ID in this run
+          if (seenPlaceIds.has(place.place_id)) {
+            continue;
+          }
+          seenPlaceIds.add(place.place_id);
+
+          // Skip non-operational businesses
+          if (place.business_status && place.business_status !== 'OPERATIONAL') {
+            continue;
+          }
+
+          result.leadsFound++;
+
+          // Check if we already have this lead by source ID
+          const existingBySourceId = getLeadBySourceId('google_maps', place.place_id);
+          if (existingBySourceId) {
+            result.leadsDuplicate++;
+            continue;
+          }
+
+          // Get detailed place information
+          const details = await getPlaceDetails(place.place_id);
+          if (!details) {
+            continue;
+          }
+
+          const { city, stateProvince, country: detectedCountry } = parseAddressComponents(details.address_components);
+
+          // Skip if not in US or CA
+          if (!detectedCountry || (detectedCountry !== 'US' && detectedCountry !== 'CA')) {
+            continue;
+          }
+
+          // Check for duplicate by business name and location
+          const existingByName = findDuplicateLead(details.name, city, stateProvince);
+          if (existingByName) {
+            result.leadsDuplicate++;
+            continue;
+          }
+
+          // Insert new lead
+          const lead = insertLead({
+            business_name: details.name,
+            business_type: classifyBusinessType(details.name, details.types),
+            website: details.website || null,
+            phone: details.formatted_phone_number || null,
+            address: details.formatted_address || null,
+            city,
+            state_province: stateProvince,
+            country: detectedCountry,
+            source: 'google_maps',
+            source_id: place.place_id,
+            google_rating: details.rating || null,
+            google_review_count: details.user_ratings_total || null
+          });
+
+          result.leadsNew++;
+          result.leads.push(lead);
+
+          onProgress?.(`Added: ${details.name} (${city}, ${stateProvince})`);
         }
-        seenPlaceIds.add(place.place_id);
-
-        // Skip non-operational businesses
-        if (place.business_status && place.business_status !== 'OPERATIONAL') {
-          continue;
-        }
-
-        result.leadsFound++;
-
-        // Check if we already have this lead by source ID
-        const existingBySourceId = getLeadBySourceId('google_maps', place.place_id);
-        if (existingBySourceId) {
-          result.leadsDuplicate++;
-          continue;
-        }
-
-        // Get detailed place information
-        const details = await getPlaceDetails(place.place_id);
-        if (!details) {
-          continue;
-        }
-
-        const { city, stateProvince, country: detectedCountry } = parseAddressComponents(details.address_components);
-
-        // Skip if not in US or CA
-        if (!detectedCountry || (detectedCountry !== 'US' && detectedCountry !== 'CA')) {
-          continue;
-        }
-
-        // Check for duplicate by business name and location
-        const existingByName = findDuplicateLead(details.name, city, stateProvince);
-        if (existingByName) {
-          result.leadsDuplicate++;
-          continue;
-        }
-
-        // Insert new lead
-        const lead = insertLead({
-          business_name: details.name,
-          business_type: classifyBusinessType(details.name, details.types),
-          website: details.website || null,
-          phone: details.formatted_phone_number || null,
-          address: details.formatted_address || null,
-          city,
-          state_province: stateProvince,
-          country: detectedCountry,
-          source: 'google_maps',
-          source_id: place.place_id,
-          google_rating: details.rating || null,
-          google_review_count: details.user_ratings_total || null
-        });
-
-        result.leadsNew++;
-        result.leads.push(lead);
-
-        onProgress?.(`Added: ${details.name} (${city}, ${stateProvince})`);
       }
     }
 
@@ -285,7 +345,7 @@ export async function discoverLeadsInMetro(
 export async function discoverLeadsInMultipleMetros(
   metros: typeof METRO_AREAS.US | typeof METRO_AREAS.CA,
   country: 'US' | 'CA',
-  queries?: string[],
+  options: DiscoveryOptions = {},
   onProgress?: (message: string) => void
 ): Promise<DiscoveryResult> {
   const totalResult: DiscoveryResult = {
@@ -298,7 +358,7 @@ export async function discoverLeadsInMultipleMetros(
   for (const metro of metros) {
     onProgress?.(`\n--- Discovering leads in ${metro.name}, ${metro.state} ---`);
 
-    const metroResult = await discoverLeadsInMetro(metro, country, queries, onProgress);
+    const metroResult = await discoverLeadsInMetro(metro, country, options, onProgress);
 
     totalResult.leadsFound += metroResult.leadsFound;
     totalResult.leadsNew += metroResult.leadsNew;

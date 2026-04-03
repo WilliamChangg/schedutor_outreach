@@ -33,7 +33,8 @@ interface PlaceDetails {
 export declare function searchPlaces(query: string, location: {
     lat: number;
     lng: number;
-}, radiusMeters?: number): Promise<PlaceResult[]>;
+}, radiusMeters?: number, // 50km default radius
+paginate?: boolean): Promise<PlaceResult[]>;
 export declare function getPlaceDetails(placeId: string): Promise<PlaceDetails | null>;
 export interface DiscoveryResult {
     leadsFound: number;
@@ -41,13 +42,18 @@ export interface DiscoveryResult {
     leadsDuplicate: number;
     leads: Lead[];
 }
+export interface DiscoveryOptions {
+    queries?: string[];
+    deep?: boolean;
+    paginate?: boolean;
+    useSublocations?: boolean;
+}
 export declare function discoverLeadsInMetro(metro: {
     name: string;
     state: string;
     lat: number;
     lng: number;
-}, country: 'US' | 'CA', queries?: string[], // Start with first 3 queries
-onProgress?: (message: string) => void): Promise<DiscoveryResult>;
-export declare function discoverLeadsInMultipleMetros(metros: typeof METRO_AREAS.US | typeof METRO_AREAS.CA, country: 'US' | 'CA', queries?: string[], onProgress?: (message: string) => void): Promise<DiscoveryResult>;
+}, country: 'US' | 'CA', options?: DiscoveryOptions, onProgress?: (message: string) => void): Promise<DiscoveryResult>;
+export declare function discoverLeadsInMultipleMetros(metros: typeof METRO_AREAS.US | typeof METRO_AREAS.CA, country: 'US' | 'CA', options?: DiscoveryOptions, onProgress?: (message: string) => void): Promise<DiscoveryResult>;
 export declare function testGoogleMapsConnection(): Promise<boolean>;
 export {};

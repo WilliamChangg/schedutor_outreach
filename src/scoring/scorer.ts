@@ -159,14 +159,19 @@ export function calculateScore(leadId: string): ScoreBreakdown {
   // Clamp score to 0-100
   totalScore = Math.max(0, Math.min(config.maxScore, totalScore));
 
-  // Determine tier
+  // Determine tier (check from highest to lowest)
   let tier = 'cold';
   let tierLabel = 'Cold Lead';
-  for (const [tierName, tierConfig] of Object.entries(config.scoreTiers)) {
-    if (totalScore >= tierConfig.min) {
-      tier = tierName;
-      tierLabel = tierConfig.label;
-    }
+
+  if (totalScore >= 70) {
+    tier = 'hot';
+    tierLabel = 'Hot Lead';
+  } else if (totalScore >= 50) {
+    tier = 'warm';
+    tierLabel = 'Warm Lead';
+  } else if (totalScore >= 30) {
+    tier = 'cool';
+    tierLabel = 'Cool Lead';
   }
 
   return {

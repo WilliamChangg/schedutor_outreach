@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { mkdirSync, existsSync } from 'fs';
@@ -12,7 +12,7 @@ if (!existsSync(DATA_DIR)) {
   mkdirSync(DATA_DIR, { recursive: true });
 }
 
-export const db = new Database(DB_PATH);
+export const db: DatabaseType = new Database(DB_PATH);
 
 // Enable foreign keys and WAL mode for better performance
 db.pragma('journal_mode = WAL');
