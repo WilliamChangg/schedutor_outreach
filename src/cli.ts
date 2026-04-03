@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { initializeDatabase, getStats, getAllLeads, getLeadsWithoutEmails } from './db/index.js';
 import { discoverLeadsInMetro, discoverLeadsInMultipleMetros, testGoogleMapsConnection } from './discovery/index.js';
-import { enrichAndSaveLead } from './enrichment/index.js';
+import { enrichAndSaveLead, enrichAllLeadsWithoutEmails } from './enrichment/index.js';
 import { scoreAllLeads, scoreAndSaveLead, explainScore } from './scoring/index.js';
 import { exportLeadsToCSV } from './utils/csv-export.js';
 import { METRO_AREAS, METRO_SUBLOCATIONS } from './utils/config.js';
@@ -70,20 +70,45 @@ async function main() {
     }
 
     case 'enrich': {
-      const limit = parseInt(args[0]) || 10;
+      const limit = parseInt(argsWithoutFlags[0]) || 10;
+      const concurrency = parseInt(argsWithoutFlags[1]) || 5;
+      const sequential = hasFlag('--sequential');
+
       const leadsToEnrich = getLeadsWithoutEmails().slice(0, limit);
+      console.log(`Enriching ${leadsToEnrich.length} leads${sequential ? ' (sequential)' : ` (${concurrency} concurrent)`}...`);
 
-      console.log(`Enriching ${leadsToEnrich.length} leads...`);
+      if (sequential) {
+        // Sequential mode for debugging
+        let totalEmails = 0;
+        for (const lead of leadsToEnrich) {
+          console.log(`Enriching: ${lead.business_name}`);
+          const result = await enrichAndSaveLead(lead.id);
+          totalEmails += result.emailsFound;
+          console.log(`  Found ${result.emailsFound} emails`);
+        }
+        console.log(`\nTotal emails found: ${totalEmails}`);
+      } else {
+        // Parallel mode (default)
+        const startTime = Date.now();
+        const result = await enrichAllLeadsWithoutEmails({
+          limit,
+          concurrency,
+          retries: 2,
+          onProgress: (stats, lead, emailsFound) => {
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            const rate = (stats.processed / parseFloat(elapsed)).toFixed(1);
+            console.log(`[${stats.processed}/${stats.total}] ${lead.business_name}: ${emailsFound} emails (${rate}/s)`);
+          }
+        });
 
-      let totalEmails = 0;
-      for (const lead of leadsToEnrich) {
-        console.log(`Enriching: ${lead.business_name}`);
-        const result = await enrichAndSaveLead(lead.id);
-        totalEmails += result.emailsFound;
-        console.log(`  Found ${result.emailsFound} emails`);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`\n=== Enrichment Complete ===`);
+        console.log(`Processed: ${result.processed}/${result.total} leads in ${elapsed}s`);
+        console.log(`Emails found: ${result.emailsFound}`);
+        console.log(`Success rate: ${((result.succeeded / result.processed) * 100).toFixed(1)}%`);
+        if (result.skipped > 0) console.log(`Skipped (no website): ${result.skipped}`);
+        if (result.failed > 0) console.log(`Failed: ${result.failed}`);
       }
-
-      console.log(`\nTotal emails found: ${totalEmails}`);
       break;
     }
 
@@ -151,7 +176,7 @@ Usage: npx tsx src/cli.ts <command> [args] [flags]
 Commands:
   test-connection              Test Google Maps API connection
   discover [city] [country]    Discover leads (default: first 5 US metros)
-  enrich [limit]               Enrich leads with emails (default: 10)
+  enrich [limit] [concurrency] Enrich leads with emails (default: 10 leads, 5 concurrent)
   score [leadId]               Score all leads or explain specific lead score
   export [filter]              Export to CSV (all|scored|verified|hot|warm)
   stats                        Show database statistics
@@ -160,12 +185,15 @@ Commands:
 
 Flags:
   --deep                       Deep discovery: all 12 queries + pagination + suburbs
+  --sequential                 Enrich one lead at a time (for debugging)
 
 Examples:
   npx tsx src/cli.ts discover Toronto CA            # Basic discovery (~30 leads)
   npx tsx src/cli.ts discover Toronto CA --deep     # Deep discovery (~300+ leads)
   npx tsx src/cli.ts discover "New York" US --deep  # Deep discovery with suburbs
-  npx tsx src/cli.ts enrich 50
+  npx tsx src/cli.ts enrich 100                     # Enrich 100 leads (5 concurrent)
+  npx tsx src/cli.ts enrich 100 10                  # Enrich 100 leads (10 concurrent)
+  npx tsx src/cli.ts enrich 10 --sequential         # Enrich 10 leads one at a time
   npx tsx src/cli.ts score
   npx tsx src/cli.ts export hot
   npx tsx src/cli.ts stats

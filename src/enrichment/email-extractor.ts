@@ -1,11 +1,12 @@
 import { request } from 'undici';
 import * as cheerio from 'cheerio';
-import { scrapingRateLimiter } from '../utils/rate-limiter.js';
+import { scrapingRateLimiter, processInParallel } from '../utils/rate-limiter.js';
 import {
   insertLeadEmail,
   emailExistsForLead,
   insertOrUpdateEnrichment,
   getLeadById,
+  getLeadsWithoutEmails,
   type Lead,
   type LeadEmail
 } from '../db/index.js';
@@ -13,15 +14,15 @@ import {
 // Common email patterns to validate
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
-// Paths to check for contact information
+const MAX_EMAILS = 2;
+
+// Paths to check for contact information - PRIORITY ORDER: contact pages first, then homepage
 const CONTACT_PATHS = [
   '/contact',
   '/contact-us',
   '/about',
   '/about-us',
-  '/team',
-  '/staff',
-  ''  // Homepage
+  '', // Homepage last - usually has less specific contact info
 ];
 
 // Keywords that indicate scheduling tools
@@ -89,9 +90,8 @@ interface EnrichmentData {
 }
 
 async function fetchPage(url: string): Promise<PageContent | null> {
+  await scrapingRateLimiter.waitForSlot();
   try {
-    await scrapingRateLimiter.waitForSlot();
-
     const response = await request(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -121,45 +121,75 @@ async function fetchPage(url: string): Promise<PageContent | null> {
   } catch (error) {
     // Silently fail on network errors
     return null;
+  } finally {
+    scrapingRateLimiter.releaseSlot();
   }
 }
 
-function extractEmails(text: string, html: string): Array<{ email: string; context: string }> {
+function extractEmails(text: string, html: string, maxEmails: number = MAX_EMAILS): Array<{ email: string; context: string }> {
   const emails: Array<{ email: string; context: string }> = [];
   const seen = new Set<string>();
+  const $ = cheerio.load(html);
 
-  // Extract from text
-  const textMatches = text.match(EMAIL_REGEX) || [];
-  for (const email of textMatches) {
+  // Helper to add email if valid and not seen
+  const addEmail = (email: string, context: string): boolean => {
+    if (emails.length >= maxEmails) return false;
     const lowerEmail = email.toLowerCase();
     if (!seen.has(lowerEmail) && isValidEmail(lowerEmail)) {
       seen.add(lowerEmail);
-
-      // Try to find context around the email
-      const contextMatch = text.match(new RegExp(`.{0,50}${email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.{0,50}`, 'i'));
-      emails.push({
-        email: lowerEmail,
-        context: contextMatch ? contextMatch[0].trim() : ''
-      });
+      emails.push({ email: lowerEmail, context: context.trim() });
+      return true;
     }
-  }
+    return false;
+  };
 
-  // Also look for mailto: links
-  const $ = cheerio.load(html);
+  // PRIORITY 1: mailto: links (most reliable)
   $('a[href^="mailto:"]').each((_, el) => {
+    if (emails.length >= maxEmails) return false;
     const href = $(el).attr('href');
     if (href) {
-      const email = href.replace('mailto:', '').split('?')[0].toLowerCase().trim();
-      if (!seen.has(email) && isValidEmail(email)) {
-        seen.add(email);
-        const linkText = $(el).text().trim();
-        emails.push({
-          email,
-          context: linkText || ''
-        });
-      }
+      const email = href.replace('mailto:', '').split('?')[0].trim();
+      const linkText = $(el).text().trim();
+      addEmail(email, linkText || 'mailto link');
     }
   });
+  if (emails.length >= maxEmails) return emails;
+
+  // PRIORITY 2: Footer section (often has business contact)
+  const footerSelectors = ['footer', '#footer', '.footer', '[role="contentinfo"]', '.site-footer'];
+  for (const selector of footerSelectors) {
+    if (emails.length >= maxEmails) break;
+    const footerHtml = $(selector).html() || '';
+    const footerText = $(selector).text() || '';
+    const footerEmails = (footerText + ' ' + footerHtml).match(EMAIL_REGEX) || [];
+    for (const email of footerEmails) {
+      if (emails.length >= maxEmails) break;
+      addEmail(email, 'footer');
+    }
+  }
+  if (emails.length >= maxEmails) return emails;
+
+  // PRIORITY 3: Contact sections
+  const contactSelectors = ['#contact', '.contact', '[class*="contact"]', '#get-in-touch', '.get-in-touch'];
+  for (const selector of contactSelectors) {
+    if (emails.length >= maxEmails) break;
+    const sectionText = $(selector).text() || '';
+    const sectionEmails = sectionText.match(EMAIL_REGEX) || [];
+    for (const email of sectionEmails) {
+      if (emails.length >= maxEmails) break;
+      addEmail(email, 'contact section');
+    }
+  }
+  if (emails.length >= maxEmails) return emails;
+
+  // PRIORITY 4: Full page text (fallback)
+  const textMatches = text.match(EMAIL_REGEX) || [];
+  for (const email of textMatches) {
+    if (emails.length >= maxEmails) break;
+    // Try to find context around the email
+    const contextMatch = text.match(new RegExp(`.{0,50}${email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.{0,50}`, 'i'));
+    addEmail(email, contextMatch ? contextMatch[0] : '');
+  }
 
   return emails;
 }
@@ -190,6 +220,19 @@ function isValidEmail(email: string): boolean {
   return true;
 }
 
+async function fetchWithRetry(url: string, retries = 2): Promise<PageContent | null> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const result = await fetchPage(url);
+
+    if (result) return result;
+
+    // exponential backoff
+    const delay = 1000 * Math.pow(2, attempt);
+    await new Promise(res => setTimeout(res, delay));
+  }
+
+  return null;
+}
 function classifyEmailRole(email: string, context: string): LeadEmail['role'] {
   const emailLower = email.toLowerCase();
   const contextLower = context.toLowerCase();
@@ -314,16 +357,22 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
 
   // Fetch multiple pages
   for (const path of CONTACT_PATHS) {
+  // Early exit if we already have enough emails
+    if (result.emails.length >= MAX_EMAILS) {
+      break;
+    }
+
     const url = baseUrl + path;
-    const page = await fetchPage(url);
+    const page = await fetchWithRetry(url);
 
     if (page) {
       allHtml.push(page.html);
       allText.push(page.text);
 
-      // Extract emails from this page
       const pageEmails = extractEmails(page.text, page.html);
       for (const { email, context } of pageEmails) {
+        if (result.emails.length >= MAX_EMAILS) break;
+
         const existing = result.emails.find(e => e.email === email);
         if (!existing) {
           result.emails.push({
@@ -334,17 +383,14 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
         }
       }
 
-      // Check for scheduling tools
       if (!result.existingSchedulingTool) {
         result.existingSchedulingTool = detectSchedulingTool(page.html, page.text);
       }
 
-      // Check for multiple tutors
       if (!result.hasMultipleTutors) {
         result.hasMultipleTutors = detectMultipleTutors(page.text);
       }
 
-      // Extract social links
       const social = extractSocialLinks(page.html);
       if (social.linkedin && !result.linkedinUrl) {
         result.linkedinUrl = social.linkedin;
@@ -431,4 +477,90 @@ export function generateEmailPatterns(domain: string, firstName?: string, lastNa
   }
 
   return patterns;
+}
+
+export interface BatchEnrichmentResult {
+  total: number;
+  processed: number;
+  emailsFound: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+}
+
+export interface BatchEnrichmentOptions {
+  concurrency?: number;
+  retries?: number;
+  onProgress?: (result: BatchEnrichmentResult, lead: Lead, emailsFound: number) => void;
+}
+
+/**
+ * Batch enrich multiple leads in parallel with rate limiting
+ */
+export async function enrichLeadsBatch(
+  leads: Lead[],
+  options: BatchEnrichmentOptions = {}
+): Promise<BatchEnrichmentResult> {
+  const { concurrency = 5, retries = 2, onProgress } = options;
+
+  const result: BatchEnrichmentResult = {
+    total: leads.length,
+    processed: 0,
+    emailsFound: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0
+  };
+
+  // Filter leads that have websites
+  const leadsWithWebsites = leads.filter(l => l.website);
+  result.skipped = leads.length - leadsWithWebsites.length;
+
+  if (leadsWithWebsites.length === 0) {
+    return result;
+  }
+
+  await processInParallel(
+    leadsWithWebsites,
+    async (lead) => {
+      const enrichResult = await enrichAndSaveLead(lead.id);
+      return { lead, emailsFound: enrichResult.emailsFound };
+    },
+    {
+      concurrency,
+      retries,
+      retryDelayMs: 2000,
+      onProgress: (completed, _total, { lead, emailsFound }) => {
+        result.processed = completed;
+        result.emailsFound += emailsFound;
+        result.succeeded++;
+        if (onProgress) {
+          onProgress(result, lead, emailsFound);
+        }
+      },
+      onError: (error, lead) => {
+        result.processed++;
+        result.failed++;
+        console.error(`Failed to enrich ${lead.business_name}: ${error.message}`);
+      }
+    }
+  );
+
+  return result;
+}
+
+/**
+ * Enrich all leads without emails in parallel batches
+ */
+export async function enrichAllLeadsWithoutEmails(
+  options: BatchEnrichmentOptions & { limit?: number } = {}
+): Promise<BatchEnrichmentResult> {
+  const { limit, ...batchOptions } = options;
+  let leads = getLeadsWithoutEmails();
+
+  if (limit && limit > 0) {
+    leads = leads.slice(0, limit);
+  }
+
+  return enrichLeadsBatch(leads, batchOptions);
 }
