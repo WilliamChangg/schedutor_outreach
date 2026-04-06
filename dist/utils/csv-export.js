@@ -1,7 +1,7 @@
 import { writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getAllLeads, getLeadEmails, getEnrichmentByLeadId, getTopScoredLeads, getLeadsWithVerifiedEmails } from '../db/index.js';
+import { getAllLeads, getLeadEmails, getEnrichmentByLeadId, getTopScoredLeads, getLeadsWithVerifiedEmails, getLeadsWithEmails } from '../db/index.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 function getScoreTier(score) {
     if (score >= 70)
@@ -73,6 +73,9 @@ export function exportLeadsToCSV(options = {}) {
         case 'verified':
             leads = getLeadsWithVerifiedEmails().slice(0, limit);
             break;
+        case 'with-emails':
+            leads = getLeadsWithEmails().slice(0, limit);
+            break;
         case 'hot':
             leads = getTopScoredLeads(limit).filter(l => l.score >= 70);
             break;
@@ -106,6 +109,9 @@ export function exportLeadsAsJSON(options = {}) {
             break;
         case 'verified':
             leads = getLeadsWithVerifiedEmails().slice(0, limit);
+            break;
+        case 'with-emails':
+            leads = getLeadsWithEmails().slice(0, limit);
             break;
         case 'hot':
             leads = getTopScoredLeads(limit).filter(l => l.score >= 70);

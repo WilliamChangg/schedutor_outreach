@@ -1,5 +1,5 @@
 export interface ExportOptions {
-    filter?: 'all' | 'scored' | 'verified' | 'hot' | 'warm';
+    filter?: 'all' | 'scored' | 'verified' | 'hot' | 'warm' | 'with-emails';
     limit?: number;
     outputPath?: string;
 }

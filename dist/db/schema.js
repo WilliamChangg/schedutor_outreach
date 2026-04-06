@@ -13,7 +13,22 @@ export const db = new Database(DB_PATH);
 // Enable foreign keys and WAL mode for better performance
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Run migrations for existing databases
+function runMigrations() {
+    // Check if enrichment_attempts column exists, if not add it
+    const tableInfo = db.prepare("PRAGMA table_info(lead_enrichment)").all();
+    const columnNames = tableInfo.map(col => col.name);
+    if (!columnNames.includes('enrichment_attempts')) {
+        db.exec(`
+      ALTER TABLE lead_enrichment ADD COLUMN enrichment_attempts INTEGER DEFAULT 0;
+      ALTER TABLE lead_enrichment ADD COLUMN last_enrichment_attempt_at TEXT;
+      ALTER TABLE lead_enrichment ADD COLUMN emails_found_count INTEGER DEFAULT 0;
+    `);
+        console.log('Migration: Added enrichment tracking columns');
+    }
+}
 export function initializeDatabase() {
+    // First create tables if they don't exist
     db.exec(`
     -- Leads table: core lead data
     CREATE TABLE IF NOT EXISTS leads (
@@ -94,7 +109,10 @@ export function initializeDatabase() {
       team_size_estimate TEXT,
       specialties TEXT,
       raw_data TEXT,
-      enriched_at TEXT NOT NULL
+      enriched_at TEXT NOT NULL,
+      enrichment_attempts INTEGER DEFAULT 0,
+      last_enrichment_attempt_at TEXT,
+      emails_found_count INTEGER DEFAULT 0
     );
 
     -- Sequence enrollments table: track which leads are in which sequences
@@ -140,6 +158,8 @@ export function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_sequence_enrollments_status ON sequence_enrollments(status);
   `);
     console.log('Database initialized successfully');
+    // Run migrations for existing databases
+    runMigrations();
 }
 export function closeDatabase() {
     db.close();

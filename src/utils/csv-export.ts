@@ -7,6 +7,8 @@ import {
   getEnrichmentByLeadId,
   getTopScoredLeads,
   getLeadsWithVerifiedEmails,
+  getLeadsWithEmails,
+  getLeadsByEmailStatus,
   type Lead
 } from '../db/index.js';
 
@@ -101,7 +103,7 @@ function rowsToCSV(rows: ExportRow[]): string {
 }
 
 export interface ExportOptions {
-  filter?: 'all' | 'scored' | 'verified' | 'hot' | 'warm';
+  filter?: 'all' | 'scored' | 'verified' | 'hot' | 'warm' | 'with-emails' | 'valid' | 'invalid' | 'catch-all' | 'unknown' | 'unverified';
   limit?: number;
   outputPath?: string;
 }
@@ -116,13 +118,29 @@ export function exportLeadsToCSV(options: ExportOptions = {}): string {
       leads = getTopScoredLeads(limit);
       break;
     case 'verified':
-      leads = getLeadsWithVerifiedEmails().slice(0, limit);
+    case 'valid':
+      leads = getLeadsByEmailStatus('valid').slice(0, limit);
+      break;
+    case 'with-emails':
+      leads = getLeadsWithEmails().slice(0, limit);
       break;
     case 'hot':
       leads = getTopScoredLeads(limit).filter(l => l.score >= 70);
       break;
     case 'warm':
       leads = getTopScoredLeads(limit).filter(l => l.score >= 50);
+      break;
+    case 'invalid':
+      leads = getLeadsByEmailStatus('invalid').slice(0, limit);
+      break;
+    case 'catch-all':
+      leads = getLeadsByEmailStatus('catch_all').slice(0, limit);
+      break;
+    case 'unknown':
+      leads = getLeadsByEmailStatus('unknown').slice(0, limit);
+      break;
+    case 'unverified':
+      leads = getLeadsByEmailStatus('unverified').slice(0, limit);
       break;
     default:
       leads = getAllLeads(limit);
@@ -158,6 +176,9 @@ export function exportLeadsAsJSON(options: ExportOptions = {}): object[] {
       break;
     case 'verified':
       leads = getLeadsWithVerifiedEmails().slice(0, limit);
+      break;
+    case 'with-emails':
+      leads = getLeadsWithEmails().slice(0, limit);
       break;
     case 'hot':
       leads = getTopScoredLeads(limit).filter(l => l.score >= 70);

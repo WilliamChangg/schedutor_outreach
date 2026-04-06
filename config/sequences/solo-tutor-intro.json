@@ -1,0 +1,24 @@
+{
+  "name": "Solo Tutor Intro v1",
+  "description": "Initial outreach sequence for solo tutors",
+  "steps": [
+    {
+      "step_number": 1,
+      "delay_hours": 0,
+      "subject_template": "Scheduling help for {{business_name}}?",
+      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>{{personalized_opening}}.</p>\n\n<p>As a solo tutor, I imagine you wear a lot of hats - teaching, marketing, scheduling, billing. What if you could automate the scheduling and payment parts?</p>\n\n<p>Schedutor lets your students book sessions directly from your website, sends automatic reminders, and handles payments. No more back-and-forth texts or chasing invoices.</p>\n\n<p>Would you be interested in seeing how it works? Takes about 10 minutes.</p>\n\n<p>Cheers,<br>William</p>"
+    },
+    {
+      "step_number": 2,
+      "delay_hours": 72,
+      "subject_template": "Re: Scheduling help for {{business_name}}?",
+      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>Just bumping this up - wanted to make sure my earlier email didn't get lost.</p>\n\n<p>Quick recap: Schedutor is a simple scheduling tool made specifically for tutors. Your students can book and pay online, and you get automatic reminders so no one forgets a session.</p>\n\n<p>Happy to do a quick walkthrough if you're curious. No strings attached.</p>\n\n<p>William</p>"
+    },
+    {
+      "step_number": 3,
+      "delay_hours": 120,
+      "subject_template": "Last note from me",
+      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>I don't want to fill up your inbox, so this will be my last note.</p>\n\n<p>If you ever want to simplify how you handle scheduling and payments, Schedutor is here. Just reply to this email anytime.</p>\n\n<p>Wishing you and your students a great year!</p>\n\n<p>William</p>"
+    }
+  ]
+}
