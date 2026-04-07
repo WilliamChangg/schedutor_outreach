@@ -1,4 +1,4 @@
-# Schedutor Outbound Sales Engine
+# Schedutor Outreach Engine
 
 Automated lead discovery and outreach system for Schedutor, targeting tutoring businesses and solo tutors across the US and Canada.
 
