@@ -1,24 +1,23 @@
 {
-  "name": "Agency Intro v1",
-  "description": "Initial outreach sequence for tutoring agencies",
+  "name": "Agency Intro",
   "steps": [
     {
       "step_number": 1,
       "delay_hours": 0,
-      "subject_template": "Quick question about {{business_name}}",
-      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>{{personalized_opening}}.</p>\n\n<p>I'm reaching out because we built Schedutor specifically for tutoring businesses like yours. It handles all the scheduling headaches - student bookings, tutor availability, reminders, and payments - so you can focus on what matters: helping students succeed.</p>\n\n<p>Would you be open to a quick 15-minute call to see if it might be a fit?</p>\n\n<p>Best,<br>William</p>"
+      "subject_template": "Quick question for {{business_name}}",
+      "body_template": "Hi{{#if first_name}} {{first_name}}{{/if}},\n\n{{personalized_opening}}.\n\nI'm building Schedutor — a scheduling and client management tool made specifically for tutoring businesses.\n\nMost tutors I talk to are juggling Google Calendar, spreadsheets, and Venmo. Schedutor puts scheduling, reminders, payments, and parent communication in one place.\n\nWould you be open to a quick 10-minute call this week?\n\nBest,\nWilliam"
     },
     {
       "step_number": 2,
       "delay_hours": 72,
-      "subject_template": "Re: Quick question about {{business_name}}",
-      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>Just following up on my note from a few days ago.</p>\n\n<p>I know scheduling can be one of the most time-consuming parts of running a tutoring business - coordinating availability, handling reschedules, chasing payments. Schedutor automates all of that.</p>\n\n<p>If you're curious, I'd be happy to show you a quick demo. No pressure either way.</p>\n\n<p>Best,<br>William</p>"
+      "subject_template": "Re: Quick question for {{business_name}}",
+      "body_template": "Hi{{#if first_name}} {{first_name}}{{/if}},\n\nJust bumping this to the top of your inbox. I know tutoring season is busy.\n\nI'd love to show you how a few {{city}} tutors are using Schedutor to save 5+ hours a week on scheduling and admin.\n\nWorth a quick chat?\n\nWilliam"
     },
     {
       "step_number": 3,
-      "delay_hours": 96,
-      "subject_template": "One more thing",
-      "body_template": "<p>Hi{{#if first_name}} {{first_name}}{{/if}},</p>\n\n<p>I'll keep this short - I've reached out a couple times about Schedutor, our scheduling platform for tutoring businesses.</p>\n\n<p>If now's not the right time, totally understand. But if scheduling is something you'd like to improve this year, I'm here to help.</p>\n\n<p>Either way, best of luck with {{business_name}}!</p>\n\n<p>William</p>"
+      "delay_hours": 120,
+      "subject_template": "Re: Quick question for {{business_name}}",
+      "body_template": "Hi{{#if first_name}} {{first_name}}{{/if}},\n\nLast note from me — I don't want to be a pest.\n\nIf scheduling and client management ever becomes a pain point, Schedutor is here. Happy to do a quick walkthrough whenever the timing is right.\n\nWishing you and {{business_name}} all the best.\n\nWilliam"
     }
   ]
 }

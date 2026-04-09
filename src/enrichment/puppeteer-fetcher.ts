@@ -1,11 +1,14 @@
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import type { Browser, Page } from 'puppeteer';
 import { scrapingRateLimiter } from '../utils/rate-limiter.js';
+
+// Register stealth plugin — patches navigator.webdriver, plugins length,
+// languages, Chrome runtime, etc. to defeat headless detection.
+puppeteer.use(StealthPlugin());
 
 let browserInstance: Browser | null = null;
 
-/**
- * Get or create the browser singleton (lazy initialization)
- */
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance) {
     browserInstance = await puppeteer.launch({
@@ -17,15 +20,13 @@ async function getBrowser(): Promise<Browser> {
         '--disable-gpu',
         '--single-process',
         '--disable-extensions',
+        '--disable-blink-features=AutomationControlled', // defeats navigator.webdriver
       ],
     });
   }
   return browserInstance;
 }
 
-/**
- * Close the browser instance (call on process exit)
- */
 export async function closeBrowser(): Promise<void> {
   if (browserInstance) {
     await browserInstance.close();
@@ -39,14 +40,10 @@ export interface PuppeteerPageContent {
   url: string;
 }
 
-/**
- * Fetch a page using Puppeteer for JavaScript-rendered content
- */
 export async function fetchWithPuppeteer(
   url: string,
   timeout: number = 30000
 ): Promise<PuppeteerPageContent | null> {
-  // Respect rate limits
   await scrapingRateLimiter.waitForSlot();
 
   const browser = await getBrowser();
@@ -55,44 +52,49 @@ export async function fetchWithPuppeteer(
   try {
     page = await browser.newPage();
 
-    // Set reasonable viewport and user agent
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-      'Chrome/120.0.0.0 Safari/537.36'
-    );
+
+    // Patch navigator properties that betray headless Chrome even with stealth plugin
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      // Make plugins non-empty so it looks like a real browser
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+    });
 
     // Block unnecessary resources for faster loading
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    // Navigate and wait for content
+    // Use domcontentloaded instead of networkidle2:
+    // networkidle2 waits for ≤2 in-flight requests for 500ms, which chat widgets
+    // and analytics beacons prevent — causing the full timeout to elapse every time.
     await page.goto(url, {
-      waitUntil: 'networkidle2',
+      waitUntil: 'domcontentloaded',
       timeout,
     });
 
-    // Wait a bit for any lazy-loaded content
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Give lazy-loaded content a moment to render after initial DOM parse
+    await Promise.race([
+      page.waitForSelector('body', { timeout: 5000 }),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
 
-    // Extract content
     const html = await page.content();
-    const text = await page.evaluate(() => document.body?.innerText || '');
+    const text = await page.evaluate(
+      () => document.body?.innerText || ''
+    );
 
     return { html, text, url };
   } catch {
     return null;
   } finally {
-    if (page) {
-      await page.close();
-    }
+    if (page) await page.close();
   }
 }

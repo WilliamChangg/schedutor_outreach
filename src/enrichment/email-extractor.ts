@@ -11,11 +11,20 @@ import {
 } from '../db/index.js';
 import { fetchWithPuppeteer } from './puppeteer-fetcher.js';
 
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-const MAX_EMAILS = 2;
-const MAX_PAGES = 12; // Cap total pages fetched per lead (increased from 6)
+// ─── REGEX ───────────────────────────────────────────────────────────
+// NOTE: Do NOT use this as a module-level singleton with .test() —
+// the /g flag persists lastIndex across calls, causing silent alternating
+// true/false results. Always call getEmailRegex() for a fresh instance.
+function getEmailRegex(): RegExp {
+  return /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+}
+// Non-global version safe for .test() calls
+const EMAIL_REGEX_TEST = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 
-// ─── EXPANDED STATIC PATHS (fallback only) ──────────────────────────
+const MAX_EMAILS = 2;
+const MAX_PAGES = 12;
+
+// ─── EXPANDED STATIC PATHS (fallback only) ───────────────────────────
 const STATIC_CONTACT_PATHS = [
   '/',
   '/contact',
@@ -49,7 +58,6 @@ const STATIC_CONTACT_PATHS = [
   '/book',
   '/booking',
   '/schedule',
-  // New paths for owner/founder info
   '/founder',
   '/owner',
   '/meet-the-team',
@@ -88,6 +96,18 @@ const INVALID_DOMAINS = [
   'gravatar.com', 'cloudflare.com',
 ];
 
+// Rotated UA pool — reduces fingerprinting from a single static string
+const USER_AGENTS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+];
+
+function getRandomUA(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 interface PageContent {
   html: string;
   text: string;
@@ -108,67 +128,107 @@ interface EnrichmentData {
   specialties: string[];
 }
 
-// ─── 1. SMARTER FETCHING ────────────────────────────────────────────
+// ─── 1. SMARTER FETCHING ─────────────────────────────────────────────
 
-// Track domains that are blocking us with time-limited blocking
-interface BlockedDomain {
-  blockedAt: number;
-  failureCount: number;
+// Separate tracking for bot-blocks vs transient network failures.
+// Previously, a single timeout would hard-block a domain for 30+ minutes,
+// causing legitimate sites to be skipped for an entire run.
+interface DomainFailure {
+  botBlockedAt: number | null;  // set only on confirmed 403/429/bot-page
+  timeoutCount: number;         // incremented on network errors/timeouts
+  lastTimeoutAt: number;        // used for temporary timeout back-off
 }
-const blockedDomains = new Map<string, BlockedDomain>();
 
-// Calculate block duration: 30min base, doubles each failure, max 24hr
+const domainFailures = new Map<string, DomainFailure>();
+
+// Cache for robots.txt allow/deny decisions
+const robotsCache = new Map<string, boolean>();
+
 function getBlockDuration(failureCount: number): number {
-  const baseMs = 30 * 60 * 1000; // 30 minutes
-  const maxMs = 24 * 60 * 60 * 1000; // 24 hours
+  const baseMs = 30 * 60 * 1000;
+  const maxMs = 24 * 60 * 60 * 1000;
   return Math.min(baseMs * Math.pow(2, failureCount - 1), maxMs);
 }
 
-function isDomainBlocked(domain: string): boolean {
-  const blocked = blockedDomains.get(domain);
-  if (!blocked) return false;
-
-  const blockDuration = getBlockDuration(blocked.failureCount);
-  if (Date.now() - blocked.blockedAt > blockDuration) {
-    // Block has expired - allow retry
-    return false;
-  }
-  return true;
+function isDomainBotBlocked(domain: string): boolean {
+  const failure = domainFailures.get(domain);
+  if (!failure?.botBlockedAt) return false;
+  return Date.now() - failure.botBlockedAt < getBlockDuration(1);
 }
 
-function markDomainBlocked(domain: string): void {
-  const existing = blockedDomains.get(domain);
-  blockedDomains.set(domain, {
-    blockedAt: Date.now(),
-    failureCount: (existing?.failureCount || 0) + 1,
+function isDomainTimeoutBacked(domain: string): boolean {
+  const failure = domainFailures.get(domain);
+  if (!failure) return false;
+  // Back off for 5 minutes after 3+ consecutive timeouts
+  if (failure.timeoutCount >= 3) {
+    return Date.now() - failure.lastTimeoutAt < 5 * 60 * 1000;
+  }
+  return false;
+}
+
+function markDomainBotBlocked(domain: string): void {
+  const existing = domainFailures.get(domain);
+  domainFailures.set(domain, {
+    botBlockedAt: Date.now(),
+    timeoutCount: existing?.timeoutCount ?? 0,
+    lastTimeoutAt: existing?.lastTimeoutAt ?? 0,
   });
 }
 
-// Helper to safely read response body with error event handling
-async function safeReadBody(body: import('undici').Dispatcher.ResponseData['body']): Promise<string | null> {
+function markDomainTimeout(domain: string): void {
+  const existing = domainFailures.get(domain);
+  domainFailures.set(domain, {
+    botBlockedAt: existing?.botBlockedAt ?? null,
+    timeoutCount: (existing?.timeoutCount ?? 0) + 1,
+    lastTimeoutAt: Date.now(),
+  });
+}
+
+async function isScrapingAllowed(baseUrl: string): Promise<boolean> {
+  let domain: string;
+  try {
+    domain = new URL(baseUrl).hostname;
+  } catch {
+    return true;
+  }
+
+  if (robotsCache.has(domain)) return robotsCache.get(domain)!;
+
+  try {
+    const resp = await request(baseUrl + '/robots.txt', {
+      headers: { 'User-Agent': getRandomUA() },
+      headersTimeout: 5000,
+      bodyTimeout: 5000,
+      maxRedirections: 3,
+    });
+    const body = await safeReadBody(resp.body);
+    // Only skip if robots.txt explicitly disallows all crawlers on all paths
+    const blocked =
+      !!body &&
+      body.includes('User-agent: *') &&
+      body.includes('Disallow: /');
+    robotsCache.set(domain, !blocked);
+    return !blocked;
+  } catch {
+    // If we can't fetch robots.txt, assume allowed
+    robotsCache.set(domain, true);
+    return true;
+  }
+}
+
+async function safeReadBody(
+  body: import('undici').Dispatcher.ResponseData['body']
+): Promise<string | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
-
-    body.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-    });
-
-    body.on('end', () => {
-      resolve(Buffer.concat(chunks).toString('utf-8'));
-    });
-
+    body.on('data', (chunk: Buffer) => chunks.push(chunk));
+    body.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     body.on('error', () => {
-      // Socket closed or other error - resolve with whatever we have
-      if (chunks.length > 0) {
-        resolve(Buffer.concat(chunks).toString('utf-8'));
-      } else {
-        resolve(null);
-      }
+      resolve(chunks.length > 0 ? Buffer.concat(chunks).toString('utf-8') : null);
     });
   });
 }
 
-// Check if HTML indicates bot protection (Cloudflare, etc.)
 function isBotProtectionPage(html: string): boolean {
   const botIndicators = [
     'Just a moment...',
@@ -181,69 +241,77 @@ function isBotProtectionPage(html: string): boolean {
     'Please verify you are a human',
     'captcha',
   ];
-  return botIndicators.some(indicator => html.includes(indicator));
+  return botIndicators.some((indicator) => html.includes(indicator));
+}
+
+function buildPageContent(html: string, url: string): PageContent {
+  const $ = cheerio.load(html);
+  $('script, style, noscript, svg').remove();
+  return {
+    html,
+    text: $('body').text().replace(/\s+/g, ' ').trim(),
+    url,
+    $,
+  };
 }
 
 async function fetchPage(url: string): Promise<PageContent | null> {
   try {
-    // Check if this domain is already known to be blocked
     const domain = new URL(url).hostname;
-    if (isDomainBlocked(domain)) {
-      return null;
-    }
+
+    // Skip confirmed bot-blocked domains
+    if (isDomainBotBlocked(domain)) return null;
+
+    // Temporarily back off domains with repeated timeout failures
+    if (isDomainTimeoutBacked(domain)) return null;
 
     await scrapingRateLimiter.waitForSlot();
 
     const response = await request(url, {
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-          'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-          'Chrome/120.0.0.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': getRandomUA(),
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'identity', // avoid compressed responses we can't parse
+        'Accept-Encoding': 'identity',
       },
       maxRedirections: 5,
       headersTimeout: 12000,
       bodyTimeout: 20000,
     });
 
+    // Confirmed bot protection — hard block the domain
+    if (response.statusCode === 403 || response.statusCode === 429) {
+      markDomainBotBlocked(domain);
+      return null;
+    }
+
     if (response.statusCode !== 200) return null;
 
     const contentType = response.headers['content-type'] || '';
-    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
-      return null; // Skip PDFs, images, etc.
+    if (
+      !contentType.includes('text/html') &&
+      !contentType.includes('application/xhtml')
+    ) {
+      return null;
     }
 
-    // Use safe body reader that handles socket errors
     const html = await safeReadBody(response.body);
     if (!html) {
-      markDomainBlocked(domain);
+      // Empty body is a transient failure, not a bot block
+      markDomainTimeout(domain);
       return null;
     }
 
-    // Check for bot protection pages
     if (isBotProtectionPage(html)) {
-      markDomainBlocked(domain);
+      markDomainBotBlocked(domain);
       return null;
     }
 
-    const $ = cheerio.load(html);
-    $('script, style, noscript, svg').remove();
-
-    return {
-      html,
-      text: $('body').text().replace(/\s+/g, ' ').trim(),
-      url,
-      $,
-    };
+    return buildPageContent(html, url);
   } catch {
-    // On error, mark domain as blocked with time-limited backoff
+    // Network errors / timeouts — count separately, do NOT hard-block
     try {
-      const domain = new URL(url).hostname;
-      markDomainBlocked(domain);
+      markDomainTimeout(new URL(url).hostname);
     } catch {}
     return null;
   }
@@ -260,23 +328,18 @@ async function fetchWithRetry(url: string, retries = 2): Promise<PageContent | n
   return null;
 }
 
-// Try multiple URL variants: www/non-www and http/https
 async function fetchWithFallback(baseUrl: string): Promise<PageContent | null> {
   const variants: string[] = [];
 
   try {
     const url = new URL(baseUrl);
-
-    // Add original URL
     variants.push(url.toString());
 
-    // Try HTTPS if HTTP
     if (url.protocol === 'http:') {
       url.protocol = 'https:';
       variants.push(url.toString());
     }
 
-    // Try with/without www for each protocol
     const urlWithWww = new URL(baseUrl);
     const urlWithoutWww = new URL(baseUrl);
 
@@ -289,7 +352,6 @@ async function fetchWithFallback(baseUrl: string): Promise<PageContent | null> {
     variants.push(urlWithWww.toString());
     variants.push(urlWithoutWww.toString());
 
-    // Also try HTTPS versions
     urlWithWww.protocol = 'https:';
     urlWithoutWww.protocol = 'https:';
     variants.push(urlWithWww.toString());
@@ -298,7 +360,6 @@ async function fetchWithFallback(baseUrl: string): Promise<PageContent | null> {
     variants.push(baseUrl);
   }
 
-  // Dedupe and try each variant
   const uniqueVariants = [...new Set(variants)];
   for (const variant of uniqueVariants) {
     const result = await fetchWithRetry(variant, 1);
@@ -308,9 +369,22 @@ async function fetchWithFallback(baseUrl: string): Promise<PageContent | null> {
   return null;
 }
 
-// ─── 2. DYNAMIC LINK DISCOVERY ──────────────────────────────────────
-// Instead of only checking hardcoded paths, discover contact/about
-// links from the actual navigation of the homepage with quality scoring.
+// ─── 2. SITEMAP PARSING ──────────────────────────────────────────────
+
+async function extractUrlsFromSitemap(baseUrl: string): Promise<string[]> {
+  const urls: string[] = [];
+  try {
+    const sitemapPage = await fetchWithRetry(baseUrl + '/sitemap.xml', 1);
+    if (!sitemapPage) return urls;
+    const matches = sitemapPage.html.match(/<loc>(.*?)<\/loc>/gi) || [];
+    for (const match of matches) {
+      urls.push(match.replace(/<\/?loc>/gi, '').trim());
+    }
+  } catch {}
+  return urls;
+}
+
+// ─── 3. DYNAMIC LINK DISCOVERY ───────────────────────────────────────
 
 interface DiscoveredLink {
   url: string;
@@ -324,7 +398,10 @@ function discoverContactLinks($: cheerio.CheerioAPI, baseUrl: string): string[] 
   const contactPatterns =
     /\b(contact|about|team|staff|people|connect|reach|get.?in.?touch|inquiry|support|founder|owner|leadership|meet|principal)\b/i;
 
-  // High-value link locations
+  // Broader patterns to catch nav links like "Meet Sarah" or "Our Approach"
+  const broadPatterns =
+    /\b(meet|our|story|approach|learn|tutor|work|welcome|hire|bio|profile)\b/i;
+
   const navSelectors = ['nav', 'header', '.nav', '.navigation', '#nav', '[role="navigation"]'];
   const footerSelectors = ['footer', '.footer', '#footer', '[role="contentinfo"]'];
 
@@ -333,75 +410,59 @@ function discoverContactLinks($: cheerio.CheerioAPI, baseUrl: string): string[] 
     const href = $el.attr('href') || '';
     const text = $el.text().toLowerCase().trim();
 
-    // Skip social media and external links
-    if (/facebook|linkedin|twitter|instagram|youtube|tiktok/i.test(href)) {
-      return;
-    }
+    if (/facebook|linkedin|twitter|instagram|youtube|tiktok/i.test(href)) return;
 
-    // Match by link text OR by href path
-    if (!contactPatterns.test(text) && !contactPatterns.test(href)) {
-      return;
-    }
+    const isInNav = navSelectors.some((sel) => $el.closest(sel).length > 0);
+    const matchesStrict = contactPatterns.test(text) || contactPatterns.test(href);
+    const matchesBroad = broadPatterns.test(text) || broadPatterns.test(href);
+
+    // Require either a strict match, or a broad match in nav (to catch "Meet Sarah" etc.)
+    if (!matchesStrict && !(matchesBroad && isInNav)) return;
 
     try {
       const resolved = new URL(href, baseUrl).toString();
       const base = new URL(baseUrl);
       const target = new URL(resolved);
 
-      // Only follow links on the same domain
-      if (target.hostname !== base.hostname &&
-          target.hostname !== 'www.' + base.hostname &&
-          'www.' + target.hostname !== base.hostname) {
+      if (
+        target.hostname !== base.hostname &&
+        target.hostname !== 'www.' + base.hostname &&
+        'www.' + target.hostname !== base.hostname
+      ) {
         return;
       }
 
-      // Normalize URL: strip trailing slash and query params for deduplication
       const normalized = resolved.replace(/\/$/, '').split('?')[0];
 
-      // Calculate score based on location and text
       let score = 0;
-
-      // Location bonuses
-      const isInNav = navSelectors.some(sel => $el.closest(sel).length > 0);
-      const isInFooter = footerSelectors.some(sel => $el.closest(sel).length > 0);
+      const isInFooter = footerSelectors.some((sel) => $el.closest(sel).length > 0);
       if (isInNav) score += 30;
       if (isInFooter) score += 20;
 
-      // High-value text matches (likely owner/decision maker)
       if (/founder|owner|principal|director/i.test(text)) score += 35;
       if (/contact|email|reach/i.test(text)) score += 25;
       if (/about|team|staff/i.test(text)) score += 15;
       if (/meet/i.test(text)) score += 20;
 
-      // Path match bonuses
       if (/\/contact/i.test(href)) score += 20;
       if (/\/about/i.test(href)) score += 10;
       if (/\/team|\/staff|\/people/i.test(href)) score += 15;
       if (/\/founder|\/owner|\/leadership/i.test(href)) score += 30;
 
       if (seenUrls.has(normalized)) {
-        // Update score if higher
-        const existing = found.find(f => f.url === normalized);
-        if (existing) {
-          existing.score = Math.max(existing.score, score);
-        }
+        const existing = found.find((f) => f.url === normalized);
+        if (existing) existing.score = Math.max(existing.score, score);
         return;
       }
       seenUrls.add(normalized);
-
       found.push({ url: normalized, score });
-    } catch {
-      // relative URL that couldn't resolve — skip
-    }
+    } catch {}
   });
 
-  // Sort by score descending, return URLs only
-  return found
-    .sort((a, b) => b.score - a.score)
-    .map(f => f.url);
+  return found.sort((a, b) => b.score - a.score).map((f) => f.url);
 }
 
-// ─── 3. COMPREHENSIVE EMAIL EXTRACTION ──────────────────────────────
+// ─── 4. COMPREHENSIVE EMAIL EXTRACTION ───────────────────────────────
 
 function extractEmails(
   page: PageContent,
@@ -413,7 +474,7 @@ function extractEmails(
 
   const addEmail = (email: string, context: string): boolean => {
     if (emails.length >= maxEmails) return false;
-    const lower = email.toLowerCase().replace(/\.$/, ''); // strip trailing dot
+    const lower = email.toLowerCase().replace(/\.$/, '');
     if (!seen.has(lower) && isValidEmail(lower)) {
       seen.add(lower);
       emails.push({ email: lower, context: context.trim().slice(0, 200) });
@@ -459,9 +520,7 @@ function extractEmails(
     try {
       const json = JSON.parse($(el).html() || '');
       extractEmailsFromJsonLd(json, (email) => addEmail(email, 'structured data'));
-    } catch {
-      // malformed JSON-LD
-    }
+    } catch {}
   });
   if (emails.length >= maxEmails) return emails;
 
@@ -481,8 +540,29 @@ function extractEmails(
   // ── P6: Itemprop="email" elements ──
   $('[itemprop="email"]').each((_, el) => {
     if (emails.length >= maxEmails) return false;
-    const email = $(el).attr('content') || $(el).attr('href')?.replace('mailto:', '') || $(el).text();
+    const email =
+      $(el).attr('content') ||
+      $(el).attr('href')?.replace('mailto:', '') ||
+      $(el).text();
     if (email) addEmail(email.trim(), 'schema.org itemprop');
+  });
+  if (emails.length >= maxEmails) return emails;
+
+  // ── P6.5: Form action mailto ──
+  // Small business sites often use mailto: as form action
+  $('form[action^="mailto:"]').each((_, el) => {
+    if (emails.length >= maxEmails) return false;
+    const action = $(el).attr('action') || '';
+    const email = action.replace('mailto:', '').split('?')[0].trim();
+    addEmail(email, 'form action mailto');
+  });
+  if (emails.length >= maxEmails) return emails;
+
+  // ── P6.6: Hidden/text inputs with recipient fields (FormMail pattern) ──
+  $('input[name="_to"], input[name="recipient"], input[name="_replyto"]').each((_, el) => {
+    if (emails.length >= maxEmails) return false;
+    const val = $(el).attr('value') || '';
+    if (val.includes('@')) addEmail(val.trim(), 'form recipient field');
   });
   if (emails.length >= maxEmails) return emails;
 
@@ -496,11 +576,10 @@ function extractEmails(
     $(selector).each((_, el) => {
       const sectionText = $(el).text() || '';
       const sectionHtml = $(el).html() || '';
-      // Check for obfuscated emails too
-      const found = extractObfuscatedEmails(sectionText);
-      for (const email of found) addEmail(email, 'footer');
-      const regexMatches = (sectionText + ' ' + sectionHtml).match(EMAIL_REGEX) || [];
-      for (const email of regexMatches) addEmail(email, 'footer');
+      for (const email of extractObfuscatedEmails(sectionText)) addEmail(email, 'footer');
+      for (const email of (sectionText + ' ' + sectionHtml).match(getEmailRegex()) || []) {
+        addEmail(email, 'footer');
+      }
     });
   }
   if (emails.length >= maxEmails) return emails;
@@ -515,12 +594,8 @@ function extractEmails(
   for (const selector of contactSelectors) {
     if (emails.length >= maxEmails) break;
     const sectionText = $(selector).text() || '';
-    for (const email of extractObfuscatedEmails(sectionText)) {
-      addEmail(email, 'contact section');
-    }
-    for (const email of sectionText.match(EMAIL_REGEX) || []) {
-      addEmail(email, 'contact section');
-    }
+    for (const email of extractObfuscatedEmails(sectionText)) addEmail(email, 'contact section');
+    for (const email of sectionText.match(getEmailRegex()) || []) addEmail(email, 'contact section');
   }
   if (emails.length >= maxEmails) return emails;
 
@@ -528,8 +603,10 @@ function extractEmails(
   $('input[type="hidden"], input[type="text"]').each((_, el) => {
     if (emails.length >= maxEmails) return false;
     const val = $(el).attr('value') || '';
-    if (EMAIL_REGEX.test(val)) {
-      addEmail(val.match(EMAIL_REGEX)![0], 'hidden input');
+    // Use non-global regex for .test() to avoid lastIndex state bug
+    if (EMAIL_REGEX_TEST.test(val)) {
+      const match = val.match(getEmailRegex());
+      if (match) addEmail(match[0], 'hidden input');
     }
   });
   if (emails.length >= maxEmails) return emails;
@@ -542,7 +619,7 @@ function extractEmails(
   if (emails.length >= maxEmails) return emails;
 
   // ── P11: Full page text regex (last resort) ──
-  for (const email of text.match(EMAIL_REGEX) || []) {
+  for (const email of text.match(getEmailRegex()) || []) {
     if (emails.length >= maxEmails) break;
     const escaped = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const ctx = text.match(new RegExp(`.{0,50}${escaped}.{0,50}`, 'i'));
@@ -552,9 +629,8 @@ function extractEmails(
   return emails;
 }
 
-// ─── 4. DEOBFUSCATION HELPERS ───────────────────────────────────────
+// ─── 5. DEOBFUSCATION HELPERS ────────────────────────────────────────
 
-// Decode CloudFlare's __cf_email__ protection
 function decodeCfEmail(encoded: string): string | null {
   try {
     const key = parseInt(encoded.substring(0, 2), 16);
@@ -569,98 +645,85 @@ function decodeCfEmail(encoded: string): string | null {
   }
 }
 
-// Normalize Unicode characters that are used to obfuscate emails
 function normalizeUnicodeEmail(text: string): string {
   return text
-    // Full-width @ (U+FF20) -> @
     .replace(/\uff20/g, '@')
-    // Ideographic full stop (U+3002) -> .
     .replace(/\u3002/g, '.')
-    // Full-width dot (U+FF0E) -> .
     .replace(/\uff0e/g, '.')
-    // Full-width letters -> ASCII
-    .replace(/[\uff01-\uff5e]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0));
+    .replace(/[\uff01-\uff5e]/g, (ch) =>
+      String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
+    );
 }
 
-// Handle common text obfuscation patterns
 function extractObfuscatedEmails(text: string): string[] {
   const results: string[] = [];
-
-  // First normalize Unicode obfuscation
   const normalizedText = normalizeUnicodeEmail(text);
 
-  // Pattern: "user [at] domain [dot] com" and variants
   const obfuscationPatterns = [
-    // Existing patterns
-    /([a-zA-Z0-9._%+-]+)\s*[$$\(]\s*at\s*[$$\)]\s*([a-zA-Z0-9.-]+)\s*[$$\(]\s*dot\s*[$$\)]\s*([a-zA-Z]{2,})/gi,
-    /([a-zA-Z0-9._%+-]+)\s*\{at\}\s*([a-zA-Z0-9.-]+)\s*\{dot\}\s*([a-zA-Z]{2,})/gi,
-    /([a-zA-Z0-9._%+-]+)\s*\bat\b\s*([a-zA-Z0-9.-]+)\s*\bdot\b\s*([a-zA-Z]{2,})/gi,
-    // "user AT domain DOT com"
-    /([a-zA-Z0-9._%+-]+)\s+AT\s+([a-zA-Z0-9.-]+)\s+DOT\s+([a-zA-Z]{2,})/g,
-
-    // NEW: Bracket notation [at] [dot] with optional spaces
-    /([a-zA-Z0-9._%+-]+)\s*\[\s*at\s*\]\s*([a-zA-Z0-9.-]+)\s*\[\s*dot\s*\]\s*([a-zA-Z]{2,})/gi,
-
-    // NEW: Hyphen separators: user-at-domain-dot-com
-    /([a-zA-Z0-9._]+)-at-([a-zA-Z0-9.-]+)-dot-([a-zA-Z]{2,})/gi,
-
-    // NEW: Spaced parenthesis ( at ) ( dot )
+    // user (at) domain (dot) com  — parenthesis variant
     /([a-zA-Z0-9._%+-]+)\s*\(\s*at\s*\)\s*([a-zA-Z0-9.-]+)\s*\(\s*dot\s*\)\s*([a-zA-Z]{2,})/gi,
 
-    // NEW: Angle brackets <at> <dot>
+    // user [at] domain [dot] com  — square bracket variant
+    /([a-zA-Z0-9._%+-]+)\s*$$\s*at\s*$$\s*([a-zA-Z0-9.-]+)\s*$$\s*dot\s*$$\s*([a-zA-Z]{2,})/gi,
+
+    // user {at} domain {dot} com  — curly brace variant
+    /([a-zA-Z0-9._%+-]+)\s*\{\s*at\s*\}\s*([a-zA-Z0-9.-]+)\s*\{\s*dot\s*\}\s*([a-zA-Z]{2,})/gi,
+
+    // user <at> domain <dot> com  — angle bracket variant
     /([a-zA-Z0-9._%+-]+)\s*<\s*at\s*>\s*([a-zA-Z0-9.-]+)\s*<\s*dot\s*>\s*([a-zA-Z]{2,})/gi,
+
+    // user at domain dot com  — plain word boundary variant (case-insensitive)
+    /([a-zA-Z0-9._%+-]+)\s+at\s+([a-zA-Z0-9.-]+)\s+dot\s+([a-zA-Z]{2,})/gi,
+
+    // user AT domain DOT com  — uppercase explicit variant
+    /([a-zA-Z0-9._%+-]+)\s+AT\s+([a-zA-Z0-9.-]+)\s+DOT\s+([a-zA-Z]{2,})/g,
+
+    // user-at-domain-dot-com  — hyphen separator variant
+    /([a-zA-Z0-9._]+)-at-([a-zA-Z0-9.-]+)-dot-([a-zA-Z]{2,})/gi,
   ];
 
   for (const pattern of obfuscationPatterns) {
     let match;
     while ((match = pattern.exec(normalizedText)) !== null) {
       const email = `${match[1]}@${match[2]}.${match[3]}`.toLowerCase();
-      if (isValidEmail(email)) {
-        results.push(email);
-      }
+      if (isValidEmail(email)) results.push(email);
     }
   }
 
-  // Handle HTML entity encoded @ symbols that might appear in text
   const entityDecoded = normalizedText
     .replace(/&#64;/g, '@')
     .replace(/&#x40;/g, '@')
     .replace(/&commat;/g, '@')
     .replace(/\(dot\)/gi, '.')
-    .replace(/\[dot\]/gi, '.')
+    .replace(/$$dot$$/gi, '.')
     .replace(/\{dot\}/gi, '.')
     .replace(/\(at\)/gi, '@')
-    .replace(/\[at\]/gi, '@')
+    .replace(/$$at$$/gi, '@')
     .replace(/\{at\}/gi, '@');
 
   if (entityDecoded !== normalizedText) {
-    const found = entityDecoded.match(EMAIL_REGEX) || [];
+    const found = entityDecoded.match(getEmailRegex()) || [];
     results.push(...found.filter(isValidEmail));
   }
 
   return results;
 }
 
-// Recursively extract emails from JSON-LD objects with depth limit
 function extractEmailsFromJsonLd(
   obj: unknown,
   onEmail: (email: string) => void,
   depth: number = 0,
   maxDepth: number = 10
 ): void {
-  // Prevent infinite recursion
   if (depth > maxDepth || !obj || typeof obj !== 'object') return;
 
   if (Array.isArray(obj)) {
-    for (const item of obj) {
-      extractEmailsFromJsonLd(item, onEmail, depth + 1, maxDepth);
-    }
+    for (const item of obj) extractEmailsFromJsonLd(item, onEmail, depth + 1, maxDepth);
     return;
   }
 
   const record = obj as Record<string, unknown>;
 
-  // Handle @graph arrays (common in WordPress/Yoast SEO)
   if (record['@graph'] && Array.isArray(record['@graph'])) {
     for (const item of record['@graph']) {
       extractEmailsFromJsonLd(item, onEmail, depth + 1, maxDepth);
@@ -671,7 +734,6 @@ function extractEmailsFromJsonLd(
     const keyLower = key.toLowerCase();
 
     if (typeof value === 'string') {
-      // Direct email-like keys
       if (
         keyLower === 'email' ||
         keyLower === 'mail' ||
@@ -681,105 +743,82 @@ function extractEmailsFromJsonLd(
         keyLower.includes('email')
       ) {
         const cleaned = value.replace('mailto:', '').trim();
-        if (cleaned.includes('@')) {
-          onEmail(cleaned);
-        }
+        if (cleaned.includes('@')) onEmail(cleaned);
       }
 
-      // Check sameAs for mailto: links
       if (keyLower === 'sameas' && value.startsWith('mailto:')) {
-        const email = value.replace('mailto:', '').split('?')[0];
-        onEmail(email);
+        onEmail(value.replace('mailto:', '').split('?')[0]);
       }
 
-      // Check URL/href fields for mailto: links
-      if ((keyLower === 'url' || keyLower === 'href') && value.startsWith('mailto:')) {
-        const email = value.replace('mailto:', '').split('?')[0];
-        onEmail(email);
+      if (
+        (keyLower === 'url' || keyLower === 'href') &&
+        value.startsWith('mailto:')
+      ) {
+        onEmail(value.replace('mailto:', '').split('?')[0]);
       }
     } else if (typeof value === 'object' && value !== null) {
-      // Recurse into nested objects (contactPoint, author, etc.)
       extractEmailsFromJsonLd(value, onEmail, depth + 1, maxDepth);
     }
   }
 }
 
-// ─── 5. IMPROVED VALIDATION ─────────────────────────────────────────
+// ─── 6. VALIDATION ───────────────────────────────────────────────────
 
 function isValidEmail(email: string): boolean {
   if (!email.includes('@') || !email.includes('.')) return false;
 
   const [localPart, domain] = email.split('@');
-
   if (!localPart || !domain) return false;
   if (localPart.length > 64 || domain.length > 253) return false;
 
-  // Domain must end with valid TLD (2-6 letters, optionally followed by country code)
-  // This catches garbage like "email@domain.comphone"
-  if (!/\.[a-z]{2,6}$/i.test(domain)) {
-    return false;
-  }
+  if (!/\.[a-z]{2,6}$/i.test(domain)) return false;
+  if (!/^[a-z0-9.-]+$/i.test(domain)) return false;
 
-  // Domain should only contain valid characters
-  if (!/^[a-z0-9.-]+$/i.test(domain)) {
-    return false;
-  }
-
-  // Invalid domains
   if (INVALID_DOMAINS.some((d) => domain === d || domain.endsWith('.' + d))) {
     return false;
   }
 
-  // Asset paths that regex accidentally matched
   if (/[/\\]/.test(email)) return false;
 
-  // File extensions that aren't TLDs
   if (/\.(png|jpg|jpeg|gif|svg|webp|css|js|json|xml|pdf|zip)$/i.test(email)) {
     return false;
   }
 
-  // Starts or ends with dot/dash in local part
   if (/^[.\-]|[.\-]$/.test(localPart)) return false;
-
-  // CSS/code artifacts
   if (/^[0-9]+px/.test(localPart) || localPart.includes('--')) return false;
-
-  // Local part should only contain valid characters
-  if (!/^[a-z0-9._%+-]+$/i.test(localPart)) {
-    return false;
-  }
+  if (!/^[a-z0-9._%+-]+$/i.test(localPart)) return false;
 
   return true;
 }
 
-// Score an email for prioritization (higher = better for outreach)
 function scoreEmailForOutreach(email: string, role: LeadEmail['role']): number {
   let score = 0;
   const prefix = email.split('@')[0].toLowerCase();
 
-  // Prefer owner/personal emails over generic ones
   if (role === 'owner') score += 30;
   if (role === 'admin') score += 20;
   if (role === 'info') score += 10;
 
-  // Personal names are best (likely decision makers)
-  if (/^[a-z]+\.[a-z]+$/.test(prefix)) score += 25; // john.smith
-  if (/^[a-z]{2,15}$/.test(prefix) && !['info', 'hello', 'contact', 'support', 'help', 'admin', 'office', 'sales', 'team', 'mail', 'email'].includes(prefix)) {
-    score += 20; // john (but not generic words)
+  if (/^[a-z]+\.[a-z]+$/.test(prefix)) score += 25;
+  if (
+    /^[a-z]{2,15}$/.test(prefix) &&
+    !['info', 'hello', 'contact', 'support', 'help', 'admin', 'office', 'sales', 'team', 'mail', 'email'].includes(prefix)
+  ) {
+    score += 20;
   }
 
-  // Generic contact emails are ok but less ideal
   if (['info', 'hello', 'contact'].includes(prefix)) score += 5;
 
-  // Penalize generic/department emails
-  if (['support', 'help', 'sales', 'billing', 'hr', 'jobs', 'careers', 'noreply', 'no-reply'].includes(prefix)) {
+  if (
+    ['support', 'help', 'sales', 'billing', 'hr', 'jobs', 'careers', 'noreply', 'no-reply'].includes(prefix)
+  ) {
     score -= 20;
   }
 
   return score;
 }
 
-// ─── UNCHANGED HELPERS ──────────────────────────────────────────────
+// ─── UNCHANGED HELPERS ───────────────────────────────────────────────
 
 function classifyEmailRole(email: string, context: string): LeadEmail['role'] {
   const emailLower = email.toLowerCase();
@@ -789,7 +828,9 @@ function classifyEmailRole(email: string, context: string): LeadEmail['role'] {
   if (/admin|manager|coordinator|operations/.test(contextLower)) return 'admin';
 
   const prefix = emailLower.split('@')[0];
-  if (['info', 'hello', 'contact', 'inquiries', 'support', 'help', 'office'].includes(prefix)) {
+  if (
+    ['info', 'hello', 'contact', 'inquiries', 'support', 'help', 'office'].includes(prefix)
+  ) {
     return 'info';
   }
   if (/^[a-z]+(\.[a-z]+)?$/.test(prefix)) return 'owner';
@@ -835,37 +876,31 @@ function extractSocialLinks(html: string): {
 function extractSpecialties(text: string): string[] {
   const lower = text.toLowerCase();
   const subjects = [
-    'math','mathematics','algebra','geometry','calculus',
-    'reading','writing','english','essay',
-    'science','physics','chemistry','biology',
-    'sat','act','gre','gmat','lsat','mcat',
-    'spanish','french','mandarin','chinese',
-    'coding','programming','computer science',
-    'elementary','middle school','high school','college',
-    'test prep','homework help','study skills',
+    'math', 'mathematics', 'algebra', 'geometry', 'calculus',
+    'reading', 'writing', 'english', 'essay',
+    'science', 'physics', 'chemistry', 'biology',
+    'sat', 'act', 'gre', 'gmat', 'lsat', 'mcat',
+    'spanish', 'french', 'mandarin', 'chinese',
+    'coding', 'programming', 'computer science',
+    'elementary', 'middle school', 'high school', 'college',
+    'test prep', 'homework help', 'study skills',
   ];
   return [...new Set(subjects.filter((s) => lower.includes(s)))].slice(0, 10);
 }
 
-// ─── 6. REWRITTEN ORCHESTRATOR ──────────────────────────────────────
+// ─── 7. ORCHESTRATOR ─────────────────────────────────────────────────
 
-// Franchises/chains where we can't scrape individual location emails
 const SKIP_FRANCHISES = [
-  'kumon',
-  'sylvan',
-  'mathnasium',
-  'huntington',
-  'oxford learning',
-  'tutor doctor',
-  'club z',
+  'kumon', 'sylvan', 'mathnasium', 'huntington',
+  'oxford learning', 'tutor doctor', 'club z',
 ];
 
 function shouldSkipLead(lead: Lead): boolean {
   const nameLower = lead.business_name.toLowerCase();
   const websiteLower = (lead.website || '').toLowerCase();
-
-  return SKIP_FRANCHISES.some(franchise =>
-    nameLower.includes(franchise) || websiteLower.includes(franchise)
+  return SKIP_FRANCHISES.some(
+    (franchise) =>
+      nameLower.includes(franchise) || websiteLower.includes(franchise)
   );
 }
 
@@ -879,14 +914,15 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
     specialties: [],
   };
 
-  // Skip franchises where we can't get individual location emails
   if (shouldSkipLead(lead)) return result;
-
   if (!lead.website) return result;
 
   let baseUrl = lead.website;
   if (!baseUrl.startsWith('http')) baseUrl = 'https://' + baseUrl;
   baseUrl = baseUrl.replace(/\/$/, '');
+
+  // Skip domains that disallow all crawlers via robots.txt
+  if (!(await isScrapingAllowed(baseUrl))) return result;
 
   const visited = new Set<string>();
   const allText: string[] = [];
@@ -895,16 +931,11 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
   const processPage = (page: PageContent) => {
     allText.push(page.text);
 
-    // Extract emails with the new comprehensive extractor
     const pageEmails = extractEmails(page, MAX_EMAILS - result.emails.length);
     for (const { email, context } of pageEmails) {
       if (result.emails.length >= MAX_EMAILS) break;
       if (!result.emails.some((e) => e.email === email)) {
-        result.emails.push({
-          email,
-          context,
-          role: classifyEmailRole(email, context),
-        });
+        result.emails.push({ email, context, role: classifyEmailRole(email, context) });
       }
     }
 
@@ -920,17 +951,17 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
     if (social.facebook && !result.facebookUrl) result.facebookUrl = social.facebook;
   };
 
-  // ── STEP 1: Fetch homepage FIRST to discover real contact links ──
+  // ── STEP 1: Fetch homepage and discover real contact links ──
+  let discoveredLinks: string[] = [];
   const homepage = await fetchWithFallback(baseUrl);
   if (homepage) {
     visited.add(homepage.url);
     pagesFetched++;
     processPage(homepage);
 
-    // Discover contact-related links from actual navigation
-    if (result.emails.length < MAX_EMAILS) {
-      const discoveredLinks = discoverContactLinks(homepage.$, baseUrl);
+    discoveredLinks = discoverContactLinks(homepage.$, baseUrl);
 
+    if (result.emails.length < MAX_EMAILS) {
       for (const link of discoveredLinks) {
         if (result.emails.length >= MAX_EMAILS || pagesFetched >= MAX_PAGES) break;
         const normalized = link.replace(/\/$/, '');
@@ -946,7 +977,7 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
     }
   }
 
-  // ── STEP 2: Fall back to static paths for anything not yet tried ──
+  // ── STEP 2: Fallback to static paths ──
   if (result.emails.length < MAX_EMAILS) {
     for (const path of STATIC_CONTACT_PATHS) {
       if (result.emails.length >= MAX_EMAILS || pagesFetched >= MAX_PAGES) break;
@@ -963,35 +994,53 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
     }
   }
 
-  // ── STEP 3: Puppeteer fallback for JS-rendered pages ──
-  // Only use if we fetched pages but found no emails (suggests JS-rendered content)
-  if (result.emails.length === 0 && pagesFetched > 0) {
-    // Try homepage with Puppeteer
-    const puppeteerHomepage = await fetchWithPuppeteer(baseUrl);
-    if (puppeteerHomepage) {
-      const $ = cheerio.load(puppeteerHomepage.html);
-      processPage({
-        html: puppeteerHomepage.html,
-        text: puppeteerHomepage.text,
-        url: puppeteerHomepage.url,
-        $,
-      });
+  // ── STEP 2.5: Sitemap pass for contact/staff/team URLs ──
+  if (result.emails.length < MAX_EMAILS) {
+    const sitemapUrls = await extractUrlsFromSitemap(baseUrl);
+    const contactishUrls = sitemapUrls
+      .filter((u) => /contact|about|team|staff|people|founder|owner/i.test(u))
+      .slice(0, 5);
 
-      // If still no emails, try /contact with Puppeteer
-      if (result.emails.length === 0) {
-        const contactUrl = baseUrl + '/contact';
-        if (!visited.has(contactUrl.replace(/\/$/, ''))) {
-          const puppeteerContact = await fetchWithPuppeteer(contactUrl);
-          if (puppeteerContact) {
-            const $contact = cheerio.load(puppeteerContact.html);
-            processPage({
-              html: puppeteerContact.html,
-              text: puppeteerContact.text,
-              url: puppeteerContact.url,
-              $: $contact,
-            });
-          }
-        }
+    for (const url of contactishUrls) {
+      if (result.emails.length >= MAX_EMAILS || pagesFetched >= MAX_PAGES) break;
+      const normalized = url.replace(/\/$/, '');
+      if (visited.has(normalized)) continue;
+      visited.add(normalized);
+
+      const page = await fetchWithRetry(normalized, 1);
+      if (page) {
+        pagesFetched++;
+        processPage(page);
+      }
+    }
+  }
+
+  // ── STEP 3: Puppeteer fallback for JS-rendered pages ──
+  // Triggered when pages were fetched but yielded no emails (JS-gated content).
+  // Now covers discovered links too — not just homepage + /contact.
+  if (result.emails.length === 0 && pagesFetched > 0) {
+    // Build an ordered list of Puppeteer targets:
+    // 1. Homepage
+    // 2. /contact
+    // 3. Top discovered links not yet attempted
+    const puppeteerTargets: string[] = [baseUrl, baseUrl + '/contact', baseUrl + '/about'];
+
+    for (const link of discoveredLinks.slice(0, 3)) {
+      if (!puppeteerTargets.includes(link)) puppeteerTargets.push(link);
+    }
+
+    for (const target of puppeteerTargets) {
+      if (result.emails.length >= MAX_EMAILS) break;
+      const puppeteerPage = await fetchWithPuppeteer(target);
+      if (puppeteerPage) {
+        const $ = cheerio.load(puppeteerPage.html);
+        $('script, style, noscript, svg').remove();
+        processPage({
+          html: puppeteerPage.html,
+          text: puppeteerPage.text,
+          url: puppeteerPage.url,
+          $,
+        });
       }
     }
   }
@@ -1000,7 +1049,7 @@ export async function enrichLead(lead: Lead): Promise<EnrichmentData> {
   return result;
 }
 
-// ─── enrichAndSaveLead stays the same ───────────────────────────────
+// ─── enrichAndSaveLead (unchanged logic) ─────────────────────────────
 
 export async function enrichAndSaveLead(leadId: string): Promise<{
   emailsFound: number;
@@ -1012,9 +1061,8 @@ export async function enrichAndSaveLead(leadId: string): Promise<{
 
   const enrichment = await enrichLead(lead);
 
-  // Sort emails by outreach score (best email first)
   const sortedEmails = enrichment.emails
-    .map(e => ({ ...e, score: scoreEmailForOutreach(e.email, e.role) }))
+    .map((e) => ({ ...e, score: scoreEmailForOutreach(e.email, e.role) }))
     .sort((a, b) => b.score - a.score);
 
   const addedEmails: string[] = [];
@@ -1050,5 +1098,9 @@ export async function enrichAndSaveLead(leadId: string): Promise<{
     emails_found_count: addedEmails.length,
   });
 
-  return { emailsFound: addedEmails.length, emails: addedEmails, enrichmentSaved: true };
+  return {
+    emailsFound: addedEmails.length,
+    emails: addedEmails,
+    enrichmentSaved: true,
+  };
 }

@@ -788,3 +788,21 @@ export function getStats(): {
     avgScore: Math.round(avgScore * 10) / 10
   };
 }
+
+/**
+ * Count emails sent today (UTC). Used by the sequence engine
+ * to enforce the daily send limit.
+ */
+export function getTodaySendCount(): number {
+  const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as count
+       FROM send_log
+       WHERE status = 'sent'
+         AND sent_at >= ?`,
+    )
+    .get(`${today}T00:00:00.000Z`) as { count: number };
+
+  return row.count;
+}

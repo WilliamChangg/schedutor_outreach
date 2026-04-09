@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 // Global error handlers to prevent crashes from socket errors
-// Suppress repeated socket errors to reduce log noise
 process.on('uncaughtException', (err) => {
   if (err.message?.includes('other side closed') || (err as any).code === 'UND_ERR_SOCKET') {
     // Silently ignore - these are expected for blocked sites
@@ -20,11 +19,7 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-// Cleanup Puppeteer browser on exit
-process.on('exit', () => {
-  // Note: closeBrowser is async but we can't await in exit handler
-  // The browser will be cleaned up by the OS anyway
-});
+process.on('exit', () => {});
 
 process.on('SIGINT', async () => {
   const { closeBrowser } = await import('./enrichment/index.js');
@@ -53,7 +48,7 @@ import {
   getEnrollmentStats,
   getSendStats,
   getLeadById,
-  getLeadsNotEnrichedCount
+  getLeadsNotEnrichedCount,
 } from './db/index.js';
 import { discoverLeadsInMetro, discoverLeadsInMultipleMetros, testGoogleMapsConnection } from './discovery/index.js';
 import { enrichAndSaveLead } from './enrichment/index.js';
@@ -66,9 +61,11 @@ import {
   enrollLeadsInSequence,
   getSequenceEngineStatus,
   previewSequenceEmail,
-  testSESConnection,
-  isSESConfigured
+  sendTestSequenceEmail,
+  sendTestSequenceAllSteps,
 } from './sequencer/index.js';
+import { testResendConnection, isResendConfigured } from './sequencer/resend-sender.js';
+import { getSendingConfig, updateSendingConfig, getEffectiveDailyLimit } from './sequencer/sending-config.js';
 import { startServer } from './web/server.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -81,8 +78,21 @@ const args = process.argv.slice(3);
 
 // Parse flags
 const hasFlag = (flag: string) => args.includes(flag);
+const getFlagValue = (flag: string): string | undefined => {
+  const idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : undefined;
+};
 const deepMode = hasFlag('--deep');
-const argsWithoutFlags = args.filter(a => !a.startsWith('--'));
+const argsWithoutFlags = args.filter((a) => !a.startsWith('--'));
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  return `${minutes}m ${remaining}s`;
+}
 
 async function main() {
   switch (command) {
@@ -102,7 +112,6 @@ async function main() {
       }
 
       if (!metroName) {
-        // Run on first 5 metros
         console.log('Running discovery on first 5 US metros...');
         const metros = METRO_AREAS.US.slice(0, 5);
         const result = await discoverLeadsInMultipleMetros(metros, 'US', options, console.log);
@@ -112,18 +121,18 @@ async function main() {
         console.log(`Duplicates: ${result.leadsDuplicate}`);
       } else {
         const metros = country === 'CA' ? METRO_AREAS.CA : METRO_AREAS.US;
-        const metro = metros.find(m => m.name.toLowerCase() === metroName.toLowerCase());
+        const metro = metros.find((m) => m.name.toLowerCase() === metroName.toLowerCase());
 
         if (!metro) {
           console.error(`Metro not found: ${metroName}`);
-          console.log('Available metros:', metros.map(m => m.name).join(', '));
+          console.log('Available metros:', metros.map((m) => m.name).join(', '));
           process.exit(1);
         }
 
         const metroKey = `${metro.name}, ${metro.state}`;
         const hasSublocations = METRO_SUBLOCATIONS[metroKey];
         if (deepMode && hasSublocations) {
-          console.log(`Sublocations available: ${hasSublocations.map(s => s.name).join(', ')}`);
+          console.log(`Sublocations available: ${hasSublocations.map((s) => s.name).join(', ')}`);
         }
 
         console.log(`Discovering leads in ${metro.name}, ${metro.state}...`);
@@ -185,7 +194,6 @@ async function main() {
     case 'verify': {
       const emailOrLimit = argsWithoutFlags[0];
 
-      // Check if it's an email address
       if (emailOrLimit && emailOrLimit.includes('@')) {
         console.log(`Verifying email: ${emailOrLimit}`);
         const result = await verifyEmail(emailOrLimit);
@@ -197,7 +205,6 @@ async function main() {
         if (result.smtpResponse) console.log(`SMTP Response: ${result.smtpResponse}`);
         if (result.error) console.log(`Error: ${result.error}`);
       } else {
-        // Batch verify
         const limit = parseInt(emailOrLimit) || 50;
         console.log(`Verifying up to ${limit} unverified emails...`);
 
@@ -300,7 +307,7 @@ async function main() {
           console.log(`\n=== Email Preview for ${lead?.business_name || leadId} ===`);
           console.log(`Subject: ${preview.subject}\n`);
           console.log('Body:');
-          console.log(preview.body.replace(/<[^>]*>/g, '')); // Strip HTML for display
+          console.log(preview.body.replace(/<[^>]*>/g, ''));
           break;
         }
 
@@ -329,9 +336,24 @@ async function main() {
 
         case 'status': {
           const status = getSequenceEngineStatus();
+          const config = getSendingConfig();
+
           console.log('\n=== Sequence Engine Status ===');
-          console.log(`SES Configured: ${status.sesConfigured ? 'Yes' : 'No'}`);
-          console.log(`Sending Paused: ${status.sendingPaused ? `Yes (${status.pauseReason})` : 'No'}`);
+          console.log(`Resend Configured: ${status.resendConfigured ? '✓ Yes' : '✗ No'}`);
+          console.log(`Sending Paused: ${status.sendingPaused ? `✗ Yes (${status.pauseReason})` : '✓ No'}`);
+          console.log(`Within Sending Window: ${status.withinSendingWindow ? '✓ Yes' : `✗ No (${config.sendingWindowStartHour}:00–${config.sendingWindowEndHour}:00 ${config.timezone})`}`);
+
+          console.log('\nSending Config:');
+          console.log(`  Daily Limit: ${status.dailyLimit}/day`);
+          console.log(`  Sent Today: ${status.sentToday}`);
+          console.log(`  Remaining Today: ${status.remainingToday}`);
+          console.log(`  Delay Between Sends: ${formatDuration(config.minDelayMs)}–${formatDuration(config.maxDelayMs)}`);
+          console.log(`  Sending Window: ${config.sendingWindowStartHour}:00–${config.sendingWindowEndHour}:00 ${config.timezone}`);
+
+          if (config.warmup) {
+            console.log(`  Warmup Start: ${config.warmup.startDate}`);
+            console.log(`  Warmup Schedule: ${config.warmup.schedule.map((s) => `Day ${s.day}: ${s.limit}/day`).join(', ')}`);
+          }
 
           console.log('\nEnrollment Stats:');
           console.log(`  Active: ${status.enrollmentStats.active}`);
@@ -353,12 +375,12 @@ async function main() {
         default:
           console.log(`
 Sequence Commands:
-  sequence list                          List all sequences
-  sequence import <template>             Import a sequence template
-  sequence show <sequence_id>            Show sequence details
-  sequence preview <seq_id> <step> <lead_id>  Preview email for a lead
-  sequence enroll <sequence_id> [limit]  Enroll leads in sequence
-  sequence status                        Show sequence engine status
+  sequence list                                    List all sequences
+  sequence import <template>                       Import a sequence template
+  sequence show <sequence_id>                      Show sequence details
+  sequence preview <seq_id> <step> <lead_id>       Preview email for a lead
+  sequence enroll <sequence_id> [limit]            Enroll leads in sequence
+  sequence status                                  Show engine status
 
 Available Templates:
   - agency-intro
@@ -379,27 +401,121 @@ Available Templates:
             break;
           }
 
-          if (!isSESConfigured()) {
-            console.error('SES not configured. Add AWS credentials to .env');
+          if (!isResendConfigured()) {
+            console.error('Resend not configured. Set RESEND_API_KEY in .env');
             break;
           }
 
           console.log(`Sending test email to ${testEmail}...`);
-          const result = await testSESConnection(testEmail);
+          const result = await testResendConnection(testEmail);
           if (result.success) {
-            console.log('Test email sent successfully!');
+            console.log('✓ Test email sent successfully! Check your inbox.');
           } else {
-            console.error(`Failed: ${result.error}`);
+            console.error(`✗ Failed: ${result.error}`);
+          }
+          break;
+        }
+
+        case 'test-sequence': {
+          const toEmail = argsWithoutFlags[1];
+          const sequenceId = argsWithoutFlags[2];
+          const leadId = argsWithoutFlags[3];
+          const stepNumber = parseInt(argsWithoutFlags[4]) || undefined;
+
+          if (!toEmail || !sequenceId || !leadId) {
+            console.error(`
+Usage:
+  npx tsx src/cli.ts send test-sequence <your_email> <sequence_id> <lead_id> [step]
+
+Examples:
+  # Send step 1 of a sequence using a specific lead's data:
+  npx tsx src/cli.ts send test-sequence william@gmail.com seq_abc lead_xyz 1
+
+  # Send all steps:
+  npx tsx src/cli.ts send test-sequence william@gmail.com seq_abc lead_xyz
+`);
+            break;
+          }
+
+          if (!isResendConfigured()) {
+            console.error('Resend not configured. Set RESEND_API_KEY in .env');
+            break;
+          }
+
+          const lead = getLeadById(leadId);
+          if (!lead) {
+            console.error(`Lead not found: ${leadId}`);
+            break;
+          }
+
+          if (stepNumber) {
+            // Send a single step
+            console.log(`Sending step ${stepNumber} of sequence ${sequenceId} to ${toEmail}...`);
+            console.log(`Using lead data from: ${lead.business_name}\n`);
+
+            const result = await sendTestSequenceEmail({
+              to: toEmail,
+              leadId,
+              sequenceId,
+              stepNumber,
+            });
+
+            if (result.success) {
+              console.log(`✓ Sent! Subject: ${result.subject}`);
+              console.log(`  Message ID: ${result.messageId}`);
+            } else {
+              console.error(`✗ Failed: ${result.error}`);
+            }
+          } else {
+            // Send all steps
+            const sequence = getSequenceById(sequenceId);
+            if (!sequence) {
+              console.error(`Sequence not found: ${sequenceId}`);
+              break;
+            }
+
+            console.log(`Sending all ${sequence.total_steps} steps of "${sequence.name}" to ${toEmail}...`);
+            console.log(`Using lead data from: ${lead.business_name}\n`);
+
+            const results = await sendTestSequenceAllSteps({
+              to: [toEmail],
+              leadId,
+              sequenceId,
+              delayBetweenMs: 3000,
+            });
+
+            let successCount = 0;
+            for (const result of results) {
+              if (result.success) {
+                successCount++;
+                console.log(`  ✓ ${result.subject}`);
+              } else {
+                console.log(`  ✗ Failed: ${result.error}`);
+              }
+            }
+
+            console.log(`\n${successCount}/${results.length} emails sent. Check your inbox!`);
           }
           break;
         }
 
         case 'queue': {
           const limit = parseInt(argsWithoutFlags[1]) || 10;
-          console.log(`Processing send queue (limit: ${limit})...`);
 
-          const result = await processSendQueue(limit, (sent, total, lead) => {
+          if (!isResendConfigured()) {
+            console.error('Resend not configured. Set RESEND_API_KEY in .env');
+            break;
+          }
+
+          const dailyLimit = getEffectiveDailyLimit();
+          console.log(`Processing send queue (batch limit: ${limit}, daily limit: ${dailyLimit}/day)...`);
+          console.log();
+
+          const result = await processSendQueue(limit, (sent, total, lead, delayMs) => {
             console.log(`[${sent}/${total}] Sent to: ${lead.business_name}`);
+            if (sent < total) {
+              console.log(`         Waiting ${formatDuration(delayMs)} before next send...`);
+            }
           });
 
           console.log('\n=== Send Queue Processed ===');
@@ -407,8 +523,79 @@ Available Templates:
           console.log(`Sent: ${result.sent}`);
           console.log(`Failed: ${result.failed}`);
           console.log(`Skipped: ${result.skipped}`);
+          if (result.dailyLimitReached) {
+            console.log(`⚠ Daily limit reached`);
+          }
           if (result.errors.length > 0) {
-            console.log('Errors:', result.errors.slice(0, 5).join('\n'));
+            console.log('\nErrors:');
+            for (const err of result.errors.slice(0, 10)) {
+              console.log(`  - ${err}`);
+            }
+          }
+          break;
+        }
+
+        case 'config': {
+          const setting = argsWithoutFlags[1];
+          const value = argsWithoutFlags[2];
+
+          if (!setting) {
+            const config = getSendingConfig();
+            const effectiveLimit = getEffectiveDailyLimit();
+            console.log('\n=== Sending Configuration ===');
+            console.log(`Daily Limit (base): ${config.dailyLimit}/day`);
+            console.log(`Daily Limit (effective): ${effectiveLimit}/day`);
+            console.log(`Delay Range: ${formatDuration(config.minDelayMs)}–${formatDuration(config.maxDelayMs)}`);
+            console.log(`Sending Window: ${config.sendingWindowStartHour}:00–${config.sendingWindowEndHour}:00 ${config.timezone}`);
+            if (config.warmup) {
+              console.log(`Warmup Start: ${config.warmup.startDate}`);
+              console.log(`Warmup Schedule:`);
+              for (const entry of config.warmup.schedule) {
+                console.log(`  Day ${entry.day}: ${entry.limit}/day`);
+              }
+            } else {
+              console.log('Warmup: disabled');
+            }
+            console.log(`\nTo change: npx tsx src/cli.ts send config <setting> <value>`);
+            console.log('Settings: daily-limit, min-delay, max-delay, window-start, window-end');
+            break;
+          }
+
+          if (!value) {
+            console.error(`Usage: npx tsx src/cli.ts send config ${setting} <value>`);
+            break;
+          }
+
+          const numVal = parseInt(value, 10);
+          if (isNaN(numVal)) {
+            console.error(`Invalid value: ${value} (must be a number)`);
+            break;
+          }
+
+          switch (setting) {
+            case 'daily-limit':
+              updateSendingConfig({ dailyLimit: numVal });
+              console.log(`✓ Daily limit set to ${numVal}/day`);
+              break;
+            case 'min-delay':
+              updateSendingConfig({ minDelayMs: numVal * 1000 });
+              console.log(`✓ Min delay set to ${numVal}s (${formatDuration(numVal * 1000)})`);
+              break;
+            case 'max-delay':
+              updateSendingConfig({ maxDelayMs: numVal * 1000 });
+              console.log(`✓ Max delay set to ${numVal}s (${formatDuration(numVal * 1000)})`);
+              break;
+            case 'window-start':
+              updateSendingConfig({ sendingWindowStartHour: numVal });
+              console.log(`✓ Sending window start set to ${numVal}:00`);
+              break;
+            case 'window-end':
+              updateSendingConfig({ sendingWindowEndHour: numVal });
+              console.log(`✓ Sending window end set to ${numVal}:00`);
+              break;
+            default:
+              console.error(`Unknown setting: ${setting}`);
+              console.log('Available: daily-limit, min-delay, max-delay, window-start, window-end');
           }
           break;
         }
@@ -416,15 +603,44 @@ Available Templates:
         default:
           console.log(`
 Send Commands:
-  send test <email>      Send a test email to verify SES setup
-  send queue [limit]     Process the send queue (default: 10)
+  send test <email>                                         Send a test email to verify Resend setup
+  send test-sequence <email> <seq_id> <lead_id> [step]     Send real sequence email(s) to yourself
+  send queue [limit]                                        Process the send queue (default: 10)
+  send config                                               Show sending configuration
+  send config <setting> <value>                             Update a setting at runtime
+
+Config Settings:
+  daily-limit <n>        Max emails per day (default: 15)
+  min-delay <seconds>    Min delay between sends (default: 45)
+  max-delay <seconds>    Max delay between sends (default: 240)
+  window-start <hour>    Start of sending window 0-23 (default: 8)
+  window-end <hour>      End of sending window 0-23 (default: 18)
+
+Examples:
+  npx tsx src/cli.ts send test william@gmail.com
+  npx tsx src/cli.ts send test-sequence william@gmail.com seq_abc lead_xyz
+  npx tsx src/cli.ts send test-sequence william@gmail.com seq_abc lead_xyz 1
+  npx tsx src/cli.ts send config daily-limit 25
+  npx tsx src/cli.ts send queue 10
 `);
       }
       break;
     }
 
     case 'export': {
-      const filter = args[0] as 'all' | 'scored' | 'verified' | 'hot' | 'warm' | 'with-emails' | 'valid' | 'invalid' | 'catch-all' | 'unknown' | 'unverified' || 'all';
+      const filter =
+        (args[0] as
+          | 'all'
+          | 'scored'
+          | 'verified'
+          | 'hot'
+          | 'warm'
+          | 'with-emails'
+          | 'valid'
+          | 'invalid'
+          | 'catch-all'
+          | 'unknown'
+          | 'unverified') || 'all';
       const result = exportLeadsToCSV({ filter });
       console.log(result);
       break;
@@ -441,6 +657,7 @@ Send Commands:
       const enrollStats = getEnrollmentStats();
       const sendStats = getSendStats();
       const notEnriched = getLeadsNotEnrichedCount();
+      const status = getSequenceEngineStatus();
 
       console.log('=== Lead Database Stats ===');
       console.log(`Total leads: ${stats.totalLeads}`);
@@ -469,6 +686,13 @@ Send Commands:
       console.log(`Sent: ${sendStats.sent}`);
       console.log(`Bounce rate: ${sendStats.bounceRate}%`);
       console.log(`Complaint rate: ${sendStats.complaintRate}%`);
+
+      console.log('\n=== Sending Budget ===');
+      console.log(`Daily limit: ${status.dailyLimit}/day`);
+      console.log(`Sent today: ${status.sentToday}`);
+      console.log(`Remaining: ${status.remainingToday}`);
+      console.log(`Resend configured: ${status.resendConfigured ? '✓' : '✗'}`);
+      console.log(`Within sending window: ${status.withinSendingWindow ? '✓' : '✗'}`);
       break;
     }
 
@@ -493,34 +717,38 @@ Schedutor Outbound Sales Engine - CLI
 Usage: npx tsx src/cli.ts <command> [args] [flags]
 
 Phase 1 - Discovery & Scoring:
-  test-connection              Test Google Maps API connection
-  discover [city] [country]    Discover leads (default: first 5 US metros)
-  enrich [limit]               Enrich leads with emails (default: 10)
-  score [leadId]               Score all leads or explain specific lead score
-  export [filter]              Export to CSV (all|with-emails|valid|invalid|catch-all|unknown|unverified|hot|warm)
-  stats                        Show all statistics
-  list [limit]                 List recent leads
-  dashboard [port]             Start web dashboard (default: 3000)
+  test-connection                Test Google Maps API connection
+  discover [city] [country]      Discover leads (default: first 5 US metros)
+  enrich [limit]                 Enrich leads with emails (default: 10)
+  score [leadId]                 Score all leads or explain specific lead score
+  export [filter]                Export to CSV (all|with-emails|valid|invalid|catch-all|unknown|unverified|hot|warm)
+  stats                          Show all statistics
+  list [limit]                   List recent leads
+  dashboard [port]               Start web dashboard (default: 3000)
 
 Phase 2 - Sequencing & Verification:
-  verify [email|limit]         Verify single email or batch (default: 50)
-  sequence <subcommand>        Manage email sequences
-  send <subcommand>            Send emails
+  verify [email|limit]           Verify single email or batch (default: 50)
+  sequence <subcommand>          Manage email sequences
+  send <subcommand>              Send emails
 
 Sequence Subcommands:
-  sequence list                List all sequences
-  sequence import <template>   Import a sequence template
-  sequence show <id>           Show sequence details
+  sequence list                  List all sequences
+  sequence import <template>     Import a sequence template
+  sequence show <id>             Show sequence details
   sequence preview <id> <step> <lead_id>   Preview email
-  sequence enroll <id> [limit] Enroll leads in sequence
-  sequence status              Show engine status
+  sequence enroll <id> [limit]   Enroll leads in sequence
+  sequence status                Show engine status
 
 Send Subcommands:
-  send test <email>            Send test email (verify SES setup)
-  send queue [limit]           Process send queue
+  send test <email>              Send test email (verify Resend setup)
+  send test-sequence <email> <seq_id> <lead_id> [step]
+                                 Send real sequence email(s) to yourself
+  send queue [limit]             Process send queue
+  send config                    Show sending config
+  send config <setting> <value>  Update config at runtime
 
 Flags:
-  --deep                       Deep discovery: all 12 queries + pagination + suburbs
+  --deep                         Deep discovery: all 12 queries + pagination + suburbs
 
 Examples:
   npx tsx src/cli.ts discover Toronto CA --deep
@@ -528,12 +756,15 @@ Examples:
   npx tsx src/cli.ts verify 100
   npx tsx src/cli.ts sequence import agency-intro
   npx tsx src/cli.ts sequence enroll <seq_id> 50
+  npx tsx src/cli.ts send test william@gmail.com
+  npx tsx src/cli.ts send test-sequence william@gmail.com <seq_id> <lead_id>
+  npx tsx src/cli.ts send config daily-limit 25
   npx tsx src/cli.ts send queue 10
 `);
   }
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('Error:', err);
   process.exit(1);
 });
