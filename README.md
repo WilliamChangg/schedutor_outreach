@@ -1,101 +1,168 @@
-# Schedutor Outbound Sales Engine
+# Schedutor Outreach Engine
 
 Automated lead discovery and outreach system for Schedutor, targeting tutoring businesses and solo tutors across the US and Canada.
 
-## Quick Start
+Built as a single TypeScript application backed by SQLite. No external SaaS dependencies beyond Amazon SES for email delivery and Google Maps API for structured place data.
 
-```bash
-# Install dependencies
-npm install
+---
 
-# Set your Google Maps API key
-export GOOGLE_MAPS_API_KEY="your-api-key"
+## Architecture
 
-# Run discovery
-npx tsx src/cli.ts discover
+    Discovery → Enrichment → Verification → Scoring → Sequencing → Reply Handling → Pipeline
 
-# Check stats
-npx tsx src/cli.ts stats
-```
+Each stage is a standalone module with its own interface. The pipeline is orchestrated conversationally via OpenClaw or invoked directly as TypeScript functions.
 
-## Phase 1 Features (Discovery + Scoring)
+---
 
-- **Lead Discovery**: Google Maps Places API integration for finding tutoring businesses
-- **Email Extraction**: Website scraping to find contact emails
-- **Lead Scoring**: Configurable 100-point scoring system
-- **CSV Export**: Export leads for manual review
+## System Design
 
-## CLI Commands
+### Data Layer
+- **SQLite** (better-sqlite3) — synchronous API, zero-ops, file-copy backups  
+- **ULID** primary keys for chronological sortability without coordination  
+- 6 core tables: `leads`, `lead_emails`, `sequences`, `sequence_steps`, `send_log`, plus pipeline state on the lead record  
+- All timestamps ISO 8601 UTC  
 
-```bash
-# Test API connection
-npx tsx src/cli.ts test-connection
+---
 
-# Discover leads
-npx tsx src/cli.ts discover "New York" US
-npx tsx src/cli.ts discover Toronto CA
-npx tsx src/cli.ts discover  # Run on first 5 US metros
+### Lead Discovery
 
-# Enrich leads with emails
-npx tsx src/cli.ts enrich 50
+Two data source strategies with deduplication:
 
-# Score leads
-npx tsx src/cli.ts score
+#### Google Maps Places API
+- Parameterized search across metro areas with configurable query terms  
+- Place Details extraction: website, phone, address, reviews, rating  
+- Aggressive response caching to stay within $200/month free tier (~5k calls)  
 
-# Export to CSV
-npx tsx src/cli.ts export hot
-npx tsx src/cli.ts export all
+#### Directory Scraping
+- Browser-based navigation of tutoring directories (Wyzant, Thumbtack, Care.com)  
+- HTML parsing via Cheerio  
+- 2–5s delay between requests, robots.txt compliance, user-agent rotation  
 
-# View stats
-npx tsx src/cli.ts stats
+#### Deduplication
+- Primary: normalized `(business_name, city, state)`  
+- Secondary: phone number and root domain  
 
-# List leads
-npx tsx src/cli.ts list 20
-```
+---
 
-## Project Structure
+### Email Verification
 
-```
-src/
-├── db/           # SQLite schema and queries
-├── discovery/    # Google Maps API integration
-├── enrichment/   # Website scraping, email extraction
-├── scoring/      # Lead scoring engine
-├── utils/        # Config, rate limiting, CSV export
-config/
-├── scoring-rules.json    # Configurable scoring weights
-data/
-└── schedutor.db          # SQLite database (auto-created)
-```
+Self-hosted SMTP-level verification. No third-party verification API.
 
-## Scoring Rules
+    DNS MX lookup → confirm mail exchange records exist
+    SMTP EHLO → establish connection to MX server
+    RCPT TO probe → check if recipient address is accepted
+    Catch-all detection → test random address to identify catch-all domains
+    Disposable check → filter known disposable email providers
+
+- Max 10 concurrent SMTP connections  
+- 1s delay between checks  
+- Results: `valid | invalid | catch_all | unknown`  
+- Only `valid` addresses enter send sequences  
+
+---
+
+### Lead Scoring
+
+Rule-based engine with configurable JSON weights. 100-point scale.
 
 | Signal | Points | Rationale |
-|--------|--------|-----------|
+|-------|--------|----------|
 | Business type = agency | +20 | Higher LTV, complex scheduling needs |
 | Has website | +10 | Established business |
-| Multiple tutors detected | +15 | Need scheduling tools most |
-| No existing scheduling tool | +15 | Green field opportunity |
-| High Google rating (4.0+) | +5 | Quality-conscious business |
-| 20+ Google reviews | +10 | Established client base |
-| Verified email found | +10 | Can reach them |
-| Social media presence | +5 | Tech-savvy |
-| Franchise location | -10 | Corporate tools, harder sell |
+| Multiple tutors mentioned on site | +15 | Multi-tutor ops need scheduling tools |
+| No scheduling tool detected | +15 | No switching cost |
+| Google rating ≥ 4.0 | +5 | Quality-conscious business |
+| Review count ≥ 20 | +10 | Established client base |
+| Verified email found | +10 | Reachable |
+| Metro population > 500k | +5 | More scheduling complexity |
+| Social media presence | +5 | Tech-savvy, likely SaaS adopter |
 
-## Coming in Phase 2
+Weights are hot-configurable via `config/scoring-rules.json`.
 
-- Email verification (SMTP checking)
-- Amazon SES integration for sending
-- Email sequence engine
-- Personalization with LLM
+---
 
-## Coming in Phase 3
+### Sequence Engine
 
-- Reply detection via IMAP
-- LLM reply classification
-- Pipeline management
-- Daily digests
+Multi-step email sequences with delivery safeguards:
 
-## License
+- **Templating**: Mustache-style `{{variables}}` populated from lead data  
+- **LLM Personalization**: Per-send personalized opening lines generated from lead website/specialties/location  
+- **Scheduling**: Sends only during 9am–5pm in the lead's local timezone  
+- **Rate Limiting**: Starts at 20/day for domain warm-up, scales by 20/day/week  
+- **Circuit Breaking**: Auto-pause at >5% bounce rate or >0.1% complaint rate  
+- **Tracking**: SES delivery/bounce/complaint via SNS webhooks; open/click via SES configuration sets  
 
-Confidential - Schedutor
+---
+
+### Reply Classification
+
+IMAP polling matches inbound replies to sent messages via `In-Reply-To` / `References` headers and `ses_message_id`.
+
+LLM classifies each reply:
+- `interested` → move to qualified stage  
+- `not_interested` → mark lost, stop sequence  
+- `question` → flag for manual response  
+- `out_of_office` → reschedule next step  
+- `unsubscribe` → terminal state, never contact again  
+
+---
+
+### Pipeline
+
+    new → scored → contacted → replied → qualified → demo → won/lost
+            ↘ unsubscribed
+
+Stage transitions are automatic except `demo → won/lost` (manual).
+
+---
+
+
+## Tech Stack
+
+| Component | Choice | Why |
+|----------|--------|-----|
+| Language | TypeScript | Type safety across the full pipeline |
+| Database | SQLite (better-sqlite3) | Zero ops, synchronous API, handles 10k+ leads trivially |
+| Email Sending | Amazon SES | $0.10/1k emails, managed deliverability |
+| Email Verification | Self-hosted SMTP check | Zero cost, MX + RCPT TO validation |
+| Lead Discovery | Google Maps Places API + Cheerio | Structured data + HTML parsing |
+| Personalization | LLM API | Email personalization, reply classification |
+
+---
+
+## Deliverability Engineering
+
+Cold email deliverability is the highest-risk component. Mitigations:
+
+1. **Separate sending domain** (`mail.schedutor.com`) — isolates primary domain reputation  
+2. **Warm-up schedule** — 20/day → +20/day/week → full volume at week 5  
+3. **Pre-send verification** — every address SMTP-verified; bounces removed immediately  
+4. **Content quality** — LLM-personalized emails, <150 words, no spam trigger words  
+5. **Automatic circuit breakers** — pause on bounce >5% or complaint >0.1%  
+6. **Compliance** — CAN-SPAM (US) and CASL (CA) compliant  
+
+---
+
+## Legal
+
+- **CAN-SPAM (US)**: B2B cold email is legal. Requires accurate sender info, physical address, unsubscribe mechanism.  
+- **CASL (Canada)**: B2B exception applies — emails sent only to conspicuously published business addresses with relevant business content.  
+
+---
+
+## Performance Targets
+
+| Metric | Target |
+|-------|--------|
+| Leads discovered/month | >2,000 |
+| Email find rate | >50% |
+| Delivery rate | >95% |
+| Open rate | >25% |
+| Reply rate | >3% |
+| Bounce rate | <3% |
+| Complaint rate | <0.05% |
+| Monthly operating cost | <$15 for 10k leads |
+
+---
+
+Each command is idempotent and safe to run on a cron schedule.
