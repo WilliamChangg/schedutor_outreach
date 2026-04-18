@@ -67,6 +67,13 @@ import {
 import { testResendConnection, isResendConfigured } from './sequencer/resend-sender.js';
 import { getSendingConfig, updateSendingConfig, getEffectiveDailyLimit } from './sequencer/sending-config.js';
 import { startServer } from './web/server.js';
+import {
+  processOutreachQueue,
+  getOutreachEligibleCount,
+  renderOutreachEmail,
+} from './outreach/index.js';
+import { getOutreachStats, getTodaySendCount } from './db/index.js';
+import { sendRawEmail } from './sequencer/resend-sender.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -627,6 +634,136 @@ Examples:
       break;
     }
 
+    case 'outreach': {
+      const subCommand = argsWithoutFlags[0];
+
+      switch (subCommand) {
+        case 'status': {
+          const eligible = getOutreachEligibleCount();
+          const stats = getOutreachStats();
+          const dailyLimit = getEffectiveDailyLimit();
+          const sentToday = getTodaySendCount();
+
+          console.log('\n=== Outreach Status ===');
+          console.log(`Eligible leads: ${eligible}`);
+          console.log(`Total outreach sent: ${stats.total}`);
+          console.log(`Sent today (all types): ${sentToday}/${dailyLimit}`);
+          console.log(`Remaining budget: ${Math.max(0, dailyLimit - sentToday)}`);
+          break;
+        }
+
+        case 'preview': {
+          const leadId = argsWithoutFlags[1];
+          if (!leadId) {
+            console.error('Usage: npx tsx src/cli.ts outreach preview <lead_id>');
+            break;
+          }
+
+          const lead = getLeadById(leadId);
+          if (!lead) {
+            console.error(`Lead not found: ${leadId}`);
+            break;
+          }
+
+          const { subject, body } = renderOutreachEmail(lead);
+          console.log(`\n=== Outreach Preview for ${lead.business_name} ===`);
+          console.log(`Subject: ${subject}\n`);
+          console.log('Body:');
+          console.log(body);
+          break;
+        }
+
+        case 'send': {
+          const limit = parseInt(argsWithoutFlags[1]) || 10;
+
+          if (!isResendConfigured()) {
+            console.error('Resend not configured. Set RESEND_API_KEY in .env');
+            break;
+          }
+
+          console.log(`Sending outreach to up to ${limit} leads...`);
+          console.log();
+
+          const result = await processOutreachQueue(limit, (sent, total, lead, delayMs) => {
+            console.log(`[${sent}/${total}] Sent to: ${lead.business_name}`);
+            if (delayMs > 0) {
+              console.log(`         Waiting ${formatDuration(delayMs)} before next send...`);
+            }
+          });
+
+          console.log('\n=== Outreach Complete ===');
+          console.log(`Processed: ${result.processed}`);
+          console.log(`Sent: ${result.sent}`);
+          console.log(`Failed: ${result.failed}`);
+          console.log(`Skipped: ${result.skipped}`);
+          if (result.dailyLimitReached) {
+            console.log('Daily limit reached');
+          }
+          if (result.errors.length > 0) {
+            console.log('\nErrors:');
+            for (const err of result.errors.slice(0, 10)) {
+              console.log(`  - ${err}`);
+            }
+          }
+          break;
+        }
+
+        case 'test': {
+          const testEmail = argsWithoutFlags[1];
+          const leadId = argsWithoutFlags[2];
+
+          if (!testEmail || !leadId) {
+            console.error('Usage: npx tsx src/cli.ts outreach test <your_email> <lead_id>');
+            break;
+          }
+
+          const lead = getLeadById(leadId);
+          if (!lead) {
+            console.error(`Lead not found: ${leadId}`);
+            break;
+          }
+
+          if (!isResendConfigured()) {
+            console.error('Resend not configured. Set RESEND_API_KEY in .env');
+            break;
+          }
+
+          const { subject, body } = renderOutreachEmail(lead);
+          console.log(`Sending test outreach to ${testEmail}...`);
+          console.log(`Using lead data from: ${lead.business_name}\n`);
+
+          const sendResult = await sendRawEmail({
+            to: testEmail,
+            subject: `[TEST] ${subject}`,
+            text: body,
+          });
+
+          if (sendResult.success) {
+            console.log('Test email sent! Check your inbox.');
+          } else {
+            console.error(`Failed: ${sendResult.error}`);
+          }
+          break;
+        }
+
+        default:
+          console.log(`
+Outreach Commands:
+  outreach status                    Show outreach statistics
+  outreach preview <lead_id>         Preview email for a lead
+  outreach send [limit]              Send outreach emails (default: 10)
+  outreach test <email> <lead_id>    Send test email to yourself
+
+Examples:
+  npx tsx src/cli.ts outreach status
+  npx tsx src/cli.ts outreach preview lead_abc123
+  npx tsx src/cli.ts outreach send 25
+  npx tsx src/cli.ts outreach test william@gmail.com lead_abc123
+`);
+      }
+      break;
+    }
+
     case 'export': {
       const filter =
         (args[0] as
@@ -726,10 +863,17 @@ Phase 1 - Discovery & Scoring:
   list [limit]                   List recent leads
   dashboard [port]               Start web dashboard (default: 3000)
 
-Phase 2 - Sequencing & Verification:
+Phase 2 - Verification & Outreach:
   verify [email|limit]           Verify single email or batch (default: 50)
-  sequence <subcommand>          Manage email sequences
+  outreach <subcommand>          Single-email outreach to verified leads
+  sequence <subcommand>          Manage email sequences (legacy)
   send <subcommand>              Send emails
+
+Outreach Subcommands:
+  outreach status                Show outreach stats and eligible leads
+  outreach preview <lead_id>     Preview outreach email for a lead
+  outreach send [limit]          Send outreach emails (default: 10)
+  outreach test <email> <lead>   Test outreach to your inbox
 
 Sequence Subcommands:
   sequence list                  List all sequences

@@ -806,3 +806,61 @@ export function getTodaySendCount(): number {
 
   return row.count;
 }
+
+// ── Outreach Functions ─────────────────────────────────────────────────────
+
+/**
+ * Get leads eligible for single outreach email.
+ * Returns leads with verified emails that haven't received outreach yet.
+ */
+export function getLeadsEligibleForOutreach(limit = 100): Array<Lead & { email_id: string; email: string }> {
+  const stmt = db.prepare(`
+    SELECT l.*, le.id as email_id, le.email
+    FROM leads l
+    INNER JOIN lead_emails le ON l.id = le.lead_id
+    WHERE le.verification_status IN ('valid', 'catch_all')
+      AND NOT EXISTS (
+        SELECT 1 FROM send_log sl
+        WHERE sl.lead_id = l.id AND sl.sequence_id IS NULL
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sequence_enrollments se
+        WHERE se.lead_id = l.id AND se.status = 'active'
+      )
+    ORDER BY l.score DESC
+    LIMIT ?
+  `);
+  return stmt.all(limit) as Array<Lead & { email_id: string; email: string }>;
+}
+
+/**
+ * Check if a lead has already received the single outreach email.
+ */
+export function hasReceivedOutreach(leadId: string): boolean {
+  const stmt = db.prepare(`
+    SELECT 1 FROM send_log
+    WHERE lead_id = ? AND sequence_id IS NULL
+    LIMIT 1
+  `);
+  return stmt.get(leadId) !== undefined;
+}
+
+/**
+ * Get statistics about single outreach sends.
+ */
+export function getOutreachStats(): { total: number; today: number } {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const totalStmt = db.prepare(`
+    SELECT COUNT(*) as count FROM send_log WHERE sequence_id IS NULL
+  `);
+  const todayStmt = db.prepare(`
+    SELECT COUNT(*) as count FROM send_log
+    WHERE sequence_id IS NULL AND sent_at >= ?
+  `);
+
+  return {
+    total: (totalStmt.get() as { count: number }).count,
+    today: (todayStmt.get(`${today}T00:00:00.000Z`) as { count: number }).count,
+  };
+}

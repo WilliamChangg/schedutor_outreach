@@ -56,6 +56,9 @@ exports.shouldPauseSending = shouldPauseSending;
 exports.getLeadsEligibleForEnrollment = getLeadsEligibleForEnrollment;
 exports.getStats = getStats;
 exports.getTodaySendCount = getTodaySendCount;
+exports.getLeadsEligibleForOutreach = getLeadsEligibleForOutreach;
+exports.hasReceivedOutreach = hasReceivedOutreach;
+exports.getOutreachStats = getOutreachStats;
 var schema_js_1 = require("./schema.js");
 var ulid_1 = require("ulid");
 // Lead operations
@@ -449,4 +452,33 @@ function getTodaySendCount() {
         .prepare("SELECT COUNT(*) as count\n       FROM send_log\n       WHERE status = 'sent'\n         AND sent_at >= ?")
         .get("".concat(today, "T00:00:00.000Z"));
     return row.count;
+}
+// ── Outreach Functions ─────────────────────────────────────────────────────
+/**
+ * Get leads eligible for single outreach email.
+ * Returns leads with verified emails that haven't received outreach yet.
+ */
+function getLeadsEligibleForOutreach(limit) {
+    if (limit === void 0) { limit = 100; }
+    var stmt = schema_js_1.db.prepare("\n    SELECT l.*, le.id as email_id, le.email\n    FROM leads l\n    INNER JOIN lead_emails le ON l.id = le.lead_id\n    WHERE le.verification_status IN ('valid', 'catch_all')\n      AND NOT EXISTS (\n        SELECT 1 FROM send_log sl\n        WHERE sl.lead_id = l.id AND sl.sequence_id IS NULL\n      )\n      AND NOT EXISTS (\n        SELECT 1 FROM sequence_enrollments se\n        WHERE se.lead_id = l.id AND se.status = 'active'\n      )\n    ORDER BY l.score DESC\n    LIMIT ?\n  ");
+    return stmt.all(limit);
+}
+/**
+ * Check if a lead has already received the single outreach email.
+ */
+function hasReceivedOutreach(leadId) {
+    var stmt = schema_js_1.db.prepare("\n    SELECT 1 FROM send_log\n    WHERE lead_id = ? AND sequence_id IS NULL\n    LIMIT 1\n  ");
+    return stmt.get(leadId) !== undefined;
+}
+/**
+ * Get statistics about single outreach sends.
+ */
+function getOutreachStats() {
+    var today = new Date().toISOString().slice(0, 10);
+    var totalStmt = schema_js_1.db.prepare("\n    SELECT COUNT(*) as count FROM send_log WHERE sequence_id IS NULL\n  ");
+    var todayStmt = schema_js_1.db.prepare("\n    SELECT COUNT(*) as count FROM send_log\n    WHERE sequence_id IS NULL AND sent_at >= ?\n  ");
+    return {
+        total: totalStmt.get().count,
+        today: todayStmt.get("".concat(today, "T00:00:00.000Z")).count,
+    };
 }

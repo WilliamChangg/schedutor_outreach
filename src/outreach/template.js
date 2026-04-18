@@ -1,0 +1,5 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.OUTREACH_BODY = exports.OUTREACH_SUBJECT = void 0;
+exports.OUTREACH_SUBJECT = 'Quick question for {{business_name}}';
+exports.OUTREACH_BODY = "Hi {{business_name}},\n\nI came across your tutoring services and wanted to reach out.\n\nI work with tutoring agencies to streamline scheduling, payments, and student management. Many teams I speak with are still relying on a mix of calendars, spreadsheets, and manual coordination, which becomes difficult to manage as they grow.\n\nSchedutor is built specifically for tutoring agencies to:\n\nCentralize tutor availability and bookings\nAutomate payments and confirmations\nManage tutors, students, and sessions in one place\nI'd be happy to show you how it works\nhttps://schedutor.com/william-chang/schedutor-demo\n\nPlease feel free to reach out with any additional questions, or if any of the times listed above do not work for you.\n\nBest,\nWilliam | Founder at Schedutor";

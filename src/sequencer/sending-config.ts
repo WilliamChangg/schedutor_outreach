@@ -39,11 +39,11 @@ export interface WarmupConfig {
 // ── Defaults ────────────────────────────────────────────────────────────────
 
 const DEFAULT_WARMUP_SCHEDULE: WarmupConfig['schedule'] = [
-  { day: 1, limit: 15 },
-  { day: 4, limit: 25 },
-  { day: 8, limit: 40 },
-  { day: 15, limit: 60 },
-  { day: 22, limit: 80 },
+  { day: 1, limit: 25 },
+  { day: 4, limit: 50 },
+  { day: 8, limit: 75 },
+  { day: 15, limit: 90 },
+  { day: 22, limit: 100 },
   { day: 29, limit: 100 },
 ];
 
