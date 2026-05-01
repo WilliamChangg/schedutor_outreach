@@ -126,7 +126,7 @@ export async function getPlaceDetails(placeId: string): Promise<PlaceDetails | n
 
   const params = new URLSearchParams({
     place_id: placeId,
-    fields: 'place_id,name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,types,address_components',
+    fields: 'place_id,name,formatted_address,types,address_components',
     key: config.googleMapsApiKey
   });
 
@@ -312,16 +312,16 @@ export async function discoverLeadsInMetro(
           const lead = insertLead({
             business_name: details.name,
             business_type: classifyBusinessType(details.name, details.types),
-            website: details.website || null,
-            phone: details.formatted_phone_number || null,
+            website: null,
+            phone: null,
             address: details.formatted_address || null,
             city,
             state_province: stateProvince,
             country: detectedCountry,
             source: 'google_maps',
             source_id: place.place_id,
-            google_rating: details.rating || null,
-            google_review_count: details.user_ratings_total || null
+            google_rating: null,
+            google_review_count: null
           });
 
           result.leadsNew++;

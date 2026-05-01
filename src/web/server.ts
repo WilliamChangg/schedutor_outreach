@@ -21,6 +21,9 @@ import {
   type Lead,
 } from '../db/index.js';
 import { db } from '../db/schema.js';
+import { processOutreachQueue, getOutreachEligibleCount } from '../outreach/index.js';
+import { isResendConfigured } from '../sequencer/resend-sender.js';
+import { getEffectiveDailyLimit, isWithinSendingWindow } from '../sequencer/sending-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -102,7 +105,10 @@ app.get('/api/leads', (req, res) => {
         leads = getAllLeads(10000).filter(l => hasReceivedOutreach(l.id));
         break;
       case 'outreach-pending':
-        leads = getLeadsWithEmails().filter(l => !hasReceivedOutreach(l.id));
+        // Only leads with valid/catch_all emails that haven't received outreach
+        leads = [...getLeadsByEmailStatus('valid'), ...getLeadsByEmailStatus('catch_all')]
+          .filter((lead, index, self) => self.findIndex(l => l.id === lead.id) === index) // dedupe
+          .filter(l => !hasReceivedOutreach(l.id));
         break;
       default:
         leads = getAllLeads(10000);
@@ -304,6 +310,55 @@ app.delete('/api/emails/:id', (req, res) => {
   }
 });
 
+// API: Get outreach status (for send button)
+app.get('/api/outreach/status', (_req, res) => {
+  try {
+    const eligible = getOutreachEligibleCount();
+    const dailyLimit = getEffectiveDailyLimit();
+    const withinWindow = isWithinSendingWindow();
+    const configured = isResendConfigured();
+
+    res.json({
+      eligible,
+      dailyLimit,
+      withinWindow,
+      configured,
+      canSend: configured && withinWindow && eligible > 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// API: Send outreach emails
+app.post('/api/outreach/send', async (req, res) => {
+  try {
+    const limit = parseInt(req.body.limit) || 10;
+
+    if (!isResendConfigured()) {
+      return res.status(400).json({ error: 'Resend not configured. Set RESEND_API_KEY in .env' });
+    }
+
+    if (!isWithinSendingWindow()) {
+      return res.status(400).json({ error: 'Outside sending window (8 AM - 6 PM ET)' });
+    }
+
+    const result = await processOutreachQueue(limit);
+
+    res.json({
+      success: true,
+      processed: result.processed,
+      sent: result.sent,
+      failed: result.failed,
+      skipped: result.skipped,
+      dailyLimitReached: result.dailyLimitReached,
+      errors: result.errors.slice(0, 5),
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // Serve dashboard HTML
 app.get('/', (_req, res) => {
   res.send(getDashboardHTML());
@@ -336,6 +391,7 @@ function getDashboardHTML(): string {
       align-items: center;
     }
     header h1 { font-size: 24px; font-weight: 600; }
+    .header-buttons { display: flex; gap: 8px; }
     .header-btn {
       background: rgba(255,255,255,0.2);
       color: white;
@@ -346,6 +402,9 @@ function getDashboardHTML(): string {
       font-size: 14px;
     }
     .header-btn:hover { background: rgba(255,255,255,0.3); }
+    .header-btn.send { background: #22c55e; border-color: #16a34a; }
+    .header-btn.send:hover { background: #16a34a; }
+    .header-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .stats-grid {
       display: grid;
@@ -514,7 +573,10 @@ function getDashboardHTML(): string {
   <div class="container">
     <header>
       <h1>Schedutor Outreach Dashboard</h1>
-      <button class="header-btn" onclick="openAddLeadModal()">+ Add Lead</button>
+      <div class="header-buttons">
+        <button class="header-btn send" id="sendOutreachBtn" onclick="openSendOutreachModal()">Send Outreach</button>
+        <button class="header-btn" onclick="openAddLeadModal()">+ Add Lead</button>
+      </div>
     </header>
 
     <div class="stats-grid" id="stats">
@@ -661,6 +723,37 @@ function getDashboardHTML(): string {
           <button type="submit" class="btn btn-primary">Add Email</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Send Outreach Modal -->
+  <div class="modal" id="sendOutreachModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Send Outreach Emails</h2>
+        <button class="modal-close" onclick="closeModal('sendOutreachModal')">&times;</button>
+      </div>
+      <div id="sendOutreachAlert"></div>
+      <div id="sendOutreachStatus" style="margin-bottom:16px;padding:12px;background:#f3f4f6;border-radius:6px;">
+        Loading status...
+      </div>
+      <form id="sendOutreachForm" onsubmit="handleSendOutreach(event)">
+        <div class="form-group">
+          <label>Number of emails to send</label>
+          <select name="limit" id="sendOutreachLimit">
+            <option value="1">1 email (test)</option>
+            <option value="5">5 emails</option>
+            <option value="10" selected>10 emails</option>
+            <option value="25">25 emails</option>
+            <option value="50">50 emails</option>
+          </select>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeModal('sendOutreachModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="sendOutreachSubmit">Send Emails</button>
+        </div>
+      </form>
+      <div id="sendOutreachResult" style="display:none;margin-top:16px;padding:12px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;"></div>
     </div>
   </div>
 
@@ -847,6 +940,84 @@ function getDashboardHTML(): string {
     function openAddLeadModal() {
       document.getElementById('addLeadForm').reset();
       openModal('addLeadModal');
+    }
+
+    async function openSendOutreachModal() {
+      document.getElementById('sendOutreachResult').style.display = 'none';
+      document.getElementById('sendOutreachAlert').innerHTML = '';
+      document.getElementById('sendOutreachSubmit').disabled = true;
+      document.getElementById('sendOutreachStatus').innerHTML = 'Loading status...';
+      openModal('sendOutreachModal');
+
+      try {
+        const res = await fetch('/api/outreach/status');
+        const status = await res.json();
+
+        let statusHtml = '';
+        if (!status.configured) {
+          statusHtml = '<strong style="color:#dc2626">Resend not configured.</strong> Set RESEND_API_KEY in .env';
+        } else if (!status.withinWindow) {
+          statusHtml = '<strong style="color:#f59e0b">Outside sending window</strong> (8 AM - 6 PM ET)';
+        } else if (status.eligible === 0) {
+          statusHtml = '<strong style="color:#6b7280">No eligible leads.</strong> All leads with valid emails have been sent outreach.';
+        } else {
+          statusHtml = \`<strong style="color:#22c55e">Ready to send!</strong><br>
+            Eligible leads: <strong>\${status.eligible}</strong><br>
+            Daily limit: <strong>\${status.dailyLimit}</strong>\`;
+          document.getElementById('sendOutreachSubmit').disabled = false;
+        }
+        document.getElementById('sendOutreachStatus').innerHTML = statusHtml;
+      } catch (err) {
+        document.getElementById('sendOutreachStatus').innerHTML = '<strong style="color:#dc2626">Error loading status</strong>';
+      }
+    }
+
+    async function handleSendOutreach(e) {
+      e.preventDefault();
+      const limit = document.getElementById('sendOutreachLimit').value;
+      const submitBtn = document.getElementById('sendOutreachSubmit');
+      const resultDiv = document.getElementById('sendOutreachResult');
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Sending...';
+      resultDiv.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/outreach/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: parseInt(limit) }),
+        });
+        const result = await res.json();
+
+        if (!res.ok) throw new Error(result.error);
+
+        let html = \`<strong>Outreach Complete!</strong><br>
+          Sent: <strong>\${result.sent}</strong><br>
+          Failed: \${result.failed}<br>
+          Skipped: \${result.skipped}\`;
+
+        if (result.dailyLimitReached) {
+          html += '<br><span style="color:#f59e0b">Daily limit reached</span>';
+        }
+        if (result.errors && result.errors.length > 0) {
+          html += '<br><br><strong>Errors:</strong><br>' + result.errors.join('<br>');
+        }
+
+        resultDiv.innerHTML = html;
+        resultDiv.style.display = 'block';
+        resultDiv.style.background = result.sent > 0 ? '#f0fdf4' : '#fef2f2';
+        resultDiv.style.borderColor = result.sent > 0 ? '#bbf7d0' : '#fecaca';
+
+        // Refresh stats and leads
+        loadStats();
+        loadLeads();
+      } catch (err) {
+        showAlert('sendOutreachAlert', err.message, 'error');
+      } finally {
+        submitBtn.textContent = 'Send Emails';
+        submitBtn.disabled = false;
+      }
     }
 
     function openAddEmailModal(leadId, leadName) {
